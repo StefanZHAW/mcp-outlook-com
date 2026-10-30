@@ -21,6 +21,7 @@ import html
 import io
 import locale
 import logging
+import math
 import os
 import re
 import shutil
@@ -31,6 +32,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from email import policy
+from itertools import groupby
 from typing import Any, Callable
 
 import pythoncom
@@ -62,6 +64,7 @@ MAX_RESULTS = _env_int("OUTLOOK_MCP_MAX_RESULTS", 50)
 MAX_BODY_CHARS = _env_int("OUTLOOK_MCP_MAX_BODY_CHARS", 8000)
 MAX_SCAN = _env_int("OUTLOOK_MCP_MAX_SCAN", 5000)
 MAX_CALENDAR_DAYS = _env_int("OUTLOOK_MCP_MAX_CALENDAR_DAYS", 366)
+MAX_FREEBUSY_DAYS = _env_int("OUTLOOK_MCP_MAX_FREEBUSY_DAYS", 62)
 PREVIEW_CHARS = _env_int("OUTLOOK_MCP_PREVIEW_CHARS", 200)
 MAX_ATTACHMENT_BYTES = _env_int("OUTLOOK_MCP_MAX_ATTACHMENT_BYTES", 30_000_000)
 # Textmenge pro Aufruf; längere Anhänge werden mit 'offset' weitergelesen.
@@ -113,6 +116,14 @@ MEETING_STATUS = {0: "Termin", 1: "Besprechung (Organisator)",
 RESPONSE_STATUS = {0: "keine", 1: "Organisator", 2: "mit Vorbehalt",
                    3: "zugesagt", 4: "abgelehnt", 5: "noch nicht beantwortet"}
 RECIPIENT_TYPE = {1: "erforderlich", 2: "optional", 3: "Ressource"}
+
+# Zeichen in Recipient.FreeBusy(..., CompleteFormat=True). Für
+# "anderswo tätig" liefert Outlook in der Praxis 5 statt 4.
+FREEBUSY_STATUS = {"0": "frei", "1": "mit Vorbehalt", "2": "beschäftigt",
+                   "3": "abwesend", "4": "anderswo tätig", "5": "anderswo tätig"}
+FREEBUSY_INTERVALS = (5, 10, 15, 30, 60)
+# Recipient.FreeBusy liefert pro Aufruf 29 Tage ab dem Startdatum.
+FREEBUSY_DAYS_PER_CALL = 28
 
 
 # ============================================================
@@ -206,6 +217,24 @@ def _has_time(text: str) -> bool:
     return ":" in (text or "")
 
 
+def _period(start_date: str, end_date: str, max_days: int) -> tuple[datetime, datetime]:
+    """Zeitraum aus start_date (Standard heute) und end_date (inklusive,
+    Standard start_date + 7 Tage)."""
+    start = _parse_date(start_date, "start_date")
+    if start is None:
+        start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    end = _parse_date(end_date, "end_date")
+    if end is None:
+        end = start + timedelta(days=7)
+    elif not _has_time(end_date):
+        end += timedelta(days=1)  # Enddatum inklusive
+    if end <= start:
+        raise ValueError("end_date muss nach start_date liegen.")
+    if (end - start).days > max_days:
+        raise ValueError(f"Zeitraum zu gross (max. {max_days} Tage).")
+    return start, end
+
+
 def _truncate(text: str, limit: int) -> str:
     text = (text or "").replace("\r\n", "\n").strip()
     if len(text) > limit:
@@ -270,7 +299,8 @@ def _shared_calendar(mailbox: str):
     except pywintypes.com_error as exc:
         raise ValueError(
             f"Kein Zugriff auf den Kalender von '{mailbox}'. "
-            "Fehlt die Freigabe (mindestens Leserechte)?"
+            "Fehlt die Freigabe (mindestens Leserechte)? "
+            "Belegte Zeiten liefert get_free_busy."
         ) from exc
 
 
@@ -520,25 +550,16 @@ def _list_calendars_impl() -> dict:
         "kalender": calendars,
         "hinweis": ("Kalender von Kolleginnen und Kollegen können über den "
                     "Parameter 'shared_mailbox' von list_events abgefragt "
-                    "werden, sofern eine Freigabe besteht."),
+                    "werden, sofern eine Freigabe mit Leserechten besteht. "
+                    "Für belegte Zeiten genügt Frei/Gebucht: get_free_busy "
+                    "bzw. find_meeting_times."),
     }
 
 
 def _list_events_impl(start_date, end_date, calendar, shared_mailbox, query,
                       limit) -> dict:
     limit = _limit(limit)
-    start = _parse_date(start_date, "start_date")
-    if start is None:
-        start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    end = _parse_date(end_date, "end_date")
-    if end is None:
-        end = start + timedelta(days=7)
-    elif not _has_time(end_date):
-        end += timedelta(days=1)  # Enddatum inklusive
-    if end <= start:
-        raise ValueError("end_date muss nach start_date liegen.")
-    if (end - start).days > MAX_CALENDAR_DAYS:
-        raise ValueError(f"Zeitraum zu gross (max. {MAX_CALENDAR_DAYS} Tage).")
+    start, end = _period(start_date, end_date, MAX_CALENDAR_DAYS)
 
     folder = (_shared_calendar(shared_mailbox) if shared_mailbox and shared_mailbox.strip()
               else _resolve_folder(calendar, FOLDER_CALENDAR))
@@ -579,6 +600,12 @@ def _list_events_impl(start_date, end_date, calendar, shared_mailbox, query,
     }
     if len(events) >= limit:
         result["hinweis"] = "Limit erreicht, Zeitraum eingrenzen für weitere Termine."
+    elif not events and shared_mailbox and shared_mailbox.strip():
+        result["hinweis"] = ("Keine Termine gefunden. Ist der Kalender nur für "
+                             "Frei/Gebucht freigegeben (auch mit Betreff und Ort), "
+                             "liefert Outlook hier keine Termine. Belegte Zeiten "
+                             "liefert get_free_busy, gemeinsame freie Zeiten "
+                             "find_meeting_times.")
     return result
 
 
@@ -625,6 +652,210 @@ def _get_event_impl(entry_id, store_id, max_body_chars) -> dict:
         "text": _truncate(_safe(item, "Body", ""), limit),
     })
     return data
+
+
+# ============================================================
+# Frei/Gebucht
+# Recipient.FreeBusy liefert die Verfügbarkeit wie die
+# Terminplanung in Outlook. Dafür genügt die Freigabe
+# "Frei/Gebucht", Leserechte auf den Kalender sind nicht nötig.
+# ============================================================
+
+def _interval(value: int) -> int:
+    interval = int(value or 15)
+    if interval not in FREEBUSY_INTERVALS:
+        raise ValueError("interval_minutes muss einer dieser Werte sein: "
+                         + ", ".join(str(v) for v in FREEBUSY_INTERVALS))
+    return interval
+
+
+def _align(dt: datetime, interval: int) -> datetime:
+    """Auf den Beginn des Intervalls abrunden."""
+    minutes = dt.hour * 60 + dt.minute
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0) + \
+        timedelta(minutes=minutes - minutes % interval)
+
+
+def _parse_clock(text: str, name: str) -> int:
+    """Uhrzeit HH:MM in Minuten seit Mitternacht."""
+    try:
+        t = datetime.strptime((text or "").strip(), "%H:%M")
+    except ValueError:
+        raise ValueError(f"Ungültige Uhrzeit für '{name}': '{text}'. Erlaubt: HH:MM")
+    return t.hour * 60 + t.minute
+
+
+def _mailboxes(emails) -> list[str]:
+    """Adressen aus einer Liste oder einem Text (getrennt durch Komma,
+    Semikolon oder Leerzeichen), ohne Duplikate."""
+    if isinstance(emails, str):
+        emails = [emails]
+    result: list[str] = []
+    for entry in emails or []:
+        for part in re.split(r"[,;\s]+", entry or ""):
+            if part and part.lower() not in (m.lower() for m in result):
+                result.append(part)
+    return result
+
+
+def _free_busy(recipient, start: datetime, end: datetime, interval: int) -> str:
+    """Status-Zeichen pro Intervall von start (auf das Intervall
+    ausgerichtet) bis end."""
+    day = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    per_call = FREEBUSY_DAYS_PER_CALL * 1440 // interval
+    data = ""
+    current = day
+    while current < end:
+        # Mittag statt Mitternacht übergeben: pywin32 rechnet die Zeit
+        # nach UTC um, Outlook nimmt davon nur das Datum und würde sonst
+        # beim Vortag beginnen.
+        chunk = recipient.FreeBusy(current.replace(hour=12), interval, True)
+        data += chunk[:per_call].ljust(per_call, "?")
+        current += timedelta(days=FREEBUSY_DAYS_PER_CALL)
+    first = int((start - day).total_seconds()) // 60 // interval
+    last = math.ceil((end - day).total_seconds() / 60 / interval)
+    return data[first:last]
+
+
+def _free_busy_people(mailboxes: list[str], include_self: bool,
+                      start: datetime, end: datetime,
+                      interval: int) -> tuple[list[dict], list[dict]]:
+    ns = _namespace()
+    targets = [("", ns.CurrentUser)] if include_self else []
+    for mailbox in mailboxes:
+        recipient = ns.CreateRecipient(mailbox)
+        recipient.Resolve()
+        targets.append((mailbox, recipient))
+
+    people, errors = [], []
+    for mailbox, recipient in targets:
+        if not recipient.Resolved:
+            errors.append({"email": mailbox, "fehler": "Adresse konnte nicht aufgelöst werden."})
+            continue
+        try:
+            slots = _free_busy(recipient, start, end, interval)
+        except pywintypes.com_error as exc:
+            log.warning("Frei/Gebucht für %s nicht verfügbar: %s", mailbox or "mich", exc)
+            errors.append({"email": mailbox, "fehler": (
+                "Frei/Gebucht-Informationen nicht verfügbar (Adresse prüfen, "
+                "externe Adressen werden nicht unterstützt).")})
+            continue
+        people.append({"email": mailbox, "name": _safe(recipient, "Name", mailbox),
+                       "slots": slots})
+    return people, errors
+
+
+def _busy_blocks(slots: str, start: datetime, interval: int) -> list[dict]:
+    blocks = []
+    pos = 0
+    for char, group in groupby(slots):
+        length = len(list(group))
+        if char != "0":
+            blocks.append({
+                "von": _fmt(start + timedelta(minutes=pos * interval)),
+                "bis": _fmt(start + timedelta(minutes=(pos + length) * interval)),
+                "status": FREEBUSY_STATUS.get(char, "unbekannt"),
+            })
+        pos += length
+    return blocks
+
+
+def _get_free_busy_impl(emails, start_date, end_date, interval_minutes) -> dict:
+    interval = _interval(interval_minutes)
+    mailboxes = _mailboxes(emails)
+    if not mailboxes:
+        raise ValueError("Mindestens eine E-Mail-Adresse angeben.")
+    start, end = _period(start_date, end_date, MAX_FREEBUSY_DAYS)
+    start = _align(start, interval)
+
+    people, errors = _free_busy_people(mailboxes, False, start, end, interval)
+    result = {
+        "zeitraum": {"von": _fmt(start), "bis": _fmt(end)},
+        "intervall_minuten": interval,
+        "personen": [{"email": p["email"], "name": p["name"],
+                      "belegt": _busy_blocks(p["slots"], start, interval)}
+                     for p in people],
+        "hinweis": "Aufgeführt sind nur belegte Zeiten, alle übrigen sind frei.",
+    }
+    if errors:
+        result["ohne_daten"] = errors
+    return result
+
+
+def _find_meeting_times_impl(emails, duration_minutes, start_date, end_date,
+                             day_start, day_end, include_self, include_weekends,
+                             allow_tentative, interval_minutes, limit) -> dict:
+    interval = _interval(interval_minutes)
+    limit = _limit(limit)
+    duration = int(duration_minutes or 0)
+    if duration < interval:
+        raise ValueError(f"duration_minutes muss mindestens {interval} betragen.")
+    hours_from = _parse_clock(day_start, "day_start")
+    hours_to = _parse_clock(day_end, "day_end")
+    if hours_to <= hours_from:
+        raise ValueError("day_end muss nach day_start liegen.")
+    mailboxes = _mailboxes(emails)
+    if not mailboxes and not include_self:
+        raise ValueError("Mindestens eine E-Mail-Adresse angeben.")
+    start, end = _period(start_date, end_date, MAX_FREEBUSY_DAYS)
+    start = _align(start, interval)
+
+    people, errors = _free_busy_people(mailboxes, include_self, start, end, interval)
+    if not people:
+        raise ValueError("Für keine Person sind Frei/Gebucht-Informationen verfügbar: "
+                         + "; ".join(f"{e['email']}: {e['fehler']}" for e in errors))
+
+    free = {"0", "1"} if allow_tentative else {"0"}
+    need = math.ceil(duration / interval)
+    now = datetime.now()
+
+    def usable(i: int) -> bool:
+        t = start + timedelta(minutes=i * interval)
+        minute = t.hour * 60 + t.minute
+        return (t >= now
+                and (include_weekends or t.weekday() < 5)
+                and hours_from <= minute and minute + interval <= hours_to
+                and all(p["slots"][i] in free for p in people))
+
+    windows = []
+    run_start = None
+    count = min(len(p["slots"]) for p in people)
+    for i in range(count + 1):
+        if i < count and usable(i):
+            if run_start is None:
+                run_start = i
+            continue
+        if run_start is not None and i - run_start >= need:
+            windows.append({
+                "von": _fmt(start + timedelta(minutes=run_start * interval)),
+                "bis": _fmt(start + timedelta(minutes=i * interval)),
+                "minuten": (i - run_start) * interval,
+            })
+        run_start = None
+
+    result = {
+        "teilnehmende": [p["name"] for p in people],
+        "zeitraum": {"von": _fmt(start), "bis": _fmt(end)},
+        "dauer_minuten": duration,
+        "anzahl": min(len(windows), limit),
+        "zeitfenster": windows[:limit],
+    }
+    notes = []
+    if errors:
+        result["ohne_daten"] = errors
+        notes.append("Personen unter 'ohne_daten' sind nicht berücksichtigt.")
+    elsewhere = [p["name"] for p in people if {"4", "5"} & set(p["slots"])]
+    if elsewhere:
+        # Ein ganztägiger Eintrag "anderswo tätig" überdeckt in Outlook
+        # alle anderen Termine des Tages.
+        notes.append("'Anderswo tätig' gilt als belegt und überdeckt in Outlook "
+                     "andere Termine (betrifft: " + ", ".join(elsewhere) + "). "
+                     "Details mit get_free_busy prüfen.")
+    if len(windows) > limit:
+        notes.append("Limit erreicht, Zeitraum eingrenzen für weitere Zeitfenster.")
+    if notes:
+        result["hinweis"] = " ".join(notes)
+    return result
 
 
 # ============================================================
@@ -974,7 +1205,9 @@ mcp = FastMCP(
         "Lesender Zugriff auf E-Mails und Kalender im klassischen Outlook. "
         "Erst mit search_mails bzw. list_events suchen, dann Details mit "
         "get_mail bzw. get_event abrufen. Anhänge mit get_attachment lesen "
-        "(Nummer 'nr' aus get_mail). Datumsangaben im Format JJJJ-MM-TT."
+        "(Nummer 'nr' aus get_mail). Für die Verfügbarkeit anderer Personen "
+        "get_free_busy, für gemeinsame freie Zeiten find_meeting_times "
+        "verwenden. Datumsangaben im Format JJJJ-MM-TT."
     ),
 )
 
@@ -1101,6 +1334,64 @@ async def get_event(entry_id: str, store_id: str = "",
     max_body_chars: Maximale Textlänge der Beschreibung.
     """
     return await _run(_get_event_impl, entry_id, store_id, max_body_chars)
+
+
+@mcp.tool()
+async def get_free_busy(
+    emails: list[str],
+    start_date: str = "",
+    end_date: str = "",
+    interval_minutes: int = 15,
+) -> dict:
+    """Liefert die belegten Zeiten von Personen oder Räumen (frei,
+    mit Vorbehalt, beschäftigt, abwesend, anderswo tätig), wie sie die
+    Terminplanung in Outlook zeigt. Funktioniert auch ohne Leserechte
+    auf den Kalender, die Freigabe "Frei/Gebucht" genügt. Betreff und
+    Ort werden nicht geliefert.
+
+    emails: E-Mail-Adressen der Personen oder Räume.
+    start_date: Beginn (JJJJ-MM-TT oder JJJJ-MM-TT HH:MM), Standard heute.
+    end_date: Ende inklusive (JJJJ-MM-TT), Standard start_date + 7 Tage.
+    interval_minutes: Auflösung in Minuten (5, 10, 15, 30 oder 60).
+    """
+    return await _run(_get_free_busy_impl, emails, start_date, end_date,
+                      interval_minutes)
+
+
+@mcp.tool()
+async def find_meeting_times(
+    emails: list[str],
+    duration_minutes: int = 30,
+    start_date: str = "",
+    end_date: str = "",
+    day_start: str = "08:00",
+    day_end: str = "17:00",
+    include_self: bool = True,
+    include_weekends: bool = False,
+    allow_tentative: bool = False,
+    interval_minutes: int = 15,
+    limit: int = 20,
+) -> dict:
+    """Sucht Zeitfenster, in denen alle Teilnehmenden frei sind, auf
+    Basis der Frei/Gebucht-Informationen (keine Leserechte nötig).
+    Liefert zusammenhängende freie Zeitfenster, die mindestens
+    duration_minutes lang sind, frühestens ab jetzt. "Anderswo tätig"
+    gilt als belegt.
+
+    emails: E-Mail-Adressen der weiteren Teilnehmenden oder Räume.
+    duration_minutes: Mindestdauer des Termins.
+    start_date / end_date: Suchzeitraum (JJJJ-MM-TT), Ende inklusive,
+        Standard heute bis heute + 7 Tage.
+    day_start / day_end: Tageszeitfenster (HH:MM), Standard 08:00 bis 17:00.
+    include_self: Eigenen Kalender mit berücksichtigen.
+    include_weekends: Auch Samstag und Sonntag durchsuchen.
+    allow_tentative: Zeiten "mit Vorbehalt" als frei werten.
+    interval_minutes: Raster in Minuten (5, 10, 15, 30 oder 60).
+    limit: Maximale Anzahl Zeitfenster.
+    """
+    return await _run(_find_meeting_times_impl, emails, duration_minutes,
+                      start_date, end_date, day_start, day_end, include_self,
+                      include_weekends, allow_tentative, interval_minutes, limit)
 
 
 def main() -> None:
