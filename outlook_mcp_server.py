@@ -5,7 +5,9 @@ Greift über das COM-Objektmodell auf das klassische Outlook zu und
 stellt Werkzeuge zum Lesen und Durchsuchen von E-Mails,
 Kalendereinträgen und Anhängen bereit. Schreibend werden nur
 E-Mail-Entwürfe angelegt (neu, Antwort, Weiterleitung) und
-ungesendete Entwürfe im Ordner Entwürfe bearbeitet. Es wird nichts
+ungesendete Entwürfe im Ordner Entwürfe bearbeitet. Besprechungs-
+einladungen werden vorbefüllt in einem Outlook-Fenster geöffnet,
+aber nicht gespeichert. Es wird nichts
 gesendet, verschoben oder gelöscht; dafür gibt es bewusst kein
 Werkzeug. Anhänge werden zum Lesen kurz in ein temporäres
 Verzeichnis gespeichert und danach wieder gelöscht.
@@ -32,7 +34,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email import policy
 from itertools import groupby
 from typing import Any, Callable
@@ -107,6 +109,8 @@ CLASS_MAIL = 43
 FORMAT_HTML = 2
 CLOSE_DISCARD = 1
 RECIPIENT_TO, RECIPIENT_CC, RECIPIENT_BCC = 1, 2, 3
+RECIPIENT_REQUIRED, RECIPIENT_OPTIONAL, RECIPIENT_RESOURCE = 1, 2, 3
+MEETING_ORGANIZER = 1
 
 PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
 PR_SENDER_SMTP = "http://schemas.microsoft.com/mapi/proptag/0x5D01001F"
@@ -1084,6 +1088,74 @@ def _update_draft_impl(entry_id, store_id, subject, to, cc, bcc, body,
 
 
 # ============================================================
+# Einladungen
+# Der Termin wird nur in einem Outlook-Fenster geöffnet, weder
+# gespeichert noch gesendet. Speichern oder Senden erfolgt dort
+# von Hand.
+# ============================================================
+
+def _com_time(dt: datetime) -> datetime:
+    # pywin32 rechnet naive Zeiten nach UTC um, eine als UTC markierte
+    # Zeit übernimmt es unverändert. Outlook liest sie als Ortszeit.
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def _meeting_period(start: str, end: str,
+                    duration_minutes: int) -> tuple[datetime, datetime]:
+    begin = _parse_date(start, "start")
+    if begin is None or not _has_time(start):
+        raise ValueError("start braucht Datum und Uhrzeit (JJJJ-MM-TT HH:MM).")
+    if end and end.strip():
+        if not _has_time(end):
+            raise ValueError("end braucht Datum und Uhrzeit (JJJJ-MM-TT HH:MM).")
+        finish = _parse_date(end, "end")
+    else:
+        finish = begin + timedelta(minutes=int(duration_minutes or 0))
+    if finish <= begin:
+        raise ValueError("Das Ende muss nach dem Beginn liegen.")
+    return begin, finish
+
+
+def _open_meeting_draft_impl(subject, start, end, duration_minutes, location,
+                             required, optional, rooms, body) -> dict:
+    begin, finish = _meeting_period(start, end, duration_minutes)
+    item = _namespace().Application.CreateItem(ITEM_TYPE_APPOINTMENT)
+    item.Subject = subject or ""
+    item.Start = _com_time(begin)
+    item.End = _com_time(finish)
+    if location:
+        item.Location = location
+    if body:
+        item.Body = body
+    _set_recipients(item, RECIPIENT_REQUIRED, required, False)
+    _set_recipients(item, RECIPIENT_OPTIONAL, optional, False)
+    _set_recipients(item, RECIPIENT_RESOURCE, rooms, False)
+    unresolved = []
+    if int(item.Recipients.Count):
+        item.MeetingStatus = MEETING_ORGANIZER
+        unresolved = _unresolved(item)
+    item.Display(False)
+
+    result = {
+        "betreff": _safe(item, "Subject", ""),
+        "beginn": _fmt(_dt(_safe(item, "Start"))),
+        "ende": _fmt(_dt(_safe(item, "End"))),
+        "ort": _safe(item, "Location", ""),
+        "erforderlich": _safe(item, "RequiredAttendees", ""),
+        "optional": _safe(item, "OptionalAttendees", ""),
+        "raeume": _safe(item, "Resources", ""),
+        "hinweis": ("In Outlook geöffnet, nicht gespeichert und nicht "
+                    "gesendet. Prüfen, bei Bedarf über die Schaltfläche eine "
+                    "Teams-Besprechung hinzufügen, dann selbst senden oder "
+                    "speichern. Wird das Fenster ohne Speichern geschlossen, "
+                    "bleibt nichts zurück."),
+    }
+    if unresolved:
+        result["nicht_aufgeloest"] = unresolved
+    return result
+
+
+# ============================================================
 # Anhänge
 # Der Anhang wird in ein eigenes temporäres Verzeichnis unter
 # festem Namen gespeichert (kein Pfad aus dem Dateinamen), der
@@ -1434,8 +1506,10 @@ mcp = FastMCP(
         "Verfügbarkeit anderer Personen get_free_busy, für gemeinsame freie "
         "Zeiten find_meeting_times verwenden. Entwürfe mit create_draft, "
         "create_reply_draft und create_forward_draft anlegen und mit "
-        "update_draft ändern. Senden und Löschen ist nicht möglich: "
-        "Entwürfe sendet die Benutzerin bzw. der Benutzer selbst in "
+        "update_draft ändern. Besprechungseinladungen öffnet "
+        "open_meeting_draft vorbefüllt in einem Outlook-Fenster, ohne zu "
+        "speichern. Senden und Löschen ist nicht möglich: Entwürfe und "
+        "Einladungen sendet die Benutzerin bzw. der Benutzer selbst in "
         "Outlook. Datumsangaben im Format JJJJ-MM-TT."
     ),
 )
@@ -1730,6 +1804,41 @@ async def update_draft(
     """
     return await _run(_update_draft_impl, entry_id, store_id, subject, to, cc,
                       bcc, body, body_mode, body_is_html, open_in_outlook)
+
+
+@mcp.tool()
+async def open_meeting_draft(
+    start: str,
+    subject: str = "",
+    end: str = "",
+    duration_minutes: int = 30,
+    location: str = "",
+    required: list[str] | None = None,
+    optional: list[str] | None = None,
+    rooms: list[str] | None = None,
+    body: str = "",
+) -> dict:
+    """Öffnet eine vorbefüllte Besprechungseinladung in einem Outlook-
+    Fenster. Sie wird weder gespeichert noch gesendet und steht erst im
+    Kalender, wenn die Benutzerin bzw. der Benutzer sie in Outlook
+    speichert oder sendet. Danach kann sie mit diesem Server nicht mehr
+    geändert werden. Ohne Teilnehmende entsteht ein einfacher Termin.
+    Eine Teams-Besprechung wird im Fenster über die Schaltfläche
+    hinzugefügt. Freie Zeiten vorher mit find_meeting_times suchen.
+
+    start: Beginn (JJJJ-MM-TT HH:MM), Ortszeit.
+    subject: Betreff.
+    end: Ende (JJJJ-MM-TT HH:MM). Leer = start + duration_minutes.
+    duration_minutes: Dauer in Minuten, wenn end leer ist (Standard 30).
+    location: Ort.
+    required / optional: E-Mail-Adressen der erforderlichen bzw.
+        optionalen Teilnehmenden.
+    rooms: E-Mail-Adressen von Räumen oder Ressourcen.
+    body: Text der Einladung (reiner Text, Zeilenumbrüche werden übernommen).
+    """
+    return await _run(_open_meeting_draft_impl, subject, start, end,
+                      duration_minutes, location, required, optional, rooms,
+                      body)
 
 
 def main() -> None:

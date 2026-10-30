@@ -1,8 +1,8 @@
 # mcp-outlook-com
 
-MCP-Server des Teams Enterprise Applications für **Claude Desktop**: lesender Zugriff auf E-Mails, Kalender und Anhänge im **klassischen Outlook** über das COM-Objektmodell, dazu das Anlegen von E-Mail-Entwürfen.
+MCP-Server des Teams Enterprise Applications für **Claude Desktop**: lesender Zugriff auf E-Mails, Kalender und Anhänge im **klassischen Outlook** über das COM-Objektmodell, dazu das Anlegen von E-Mail-Entwürfen und das Vorbereiten von Besprechungseinladungen.
 
-Schreibend werden nur Entwürfe angelegt (neue Mail, Antwort, Weiterleitung) und ungesendete Entwürfe im Ordner Entwürfe geändert. Es wird nichts gesendet, verschoben oder gelöscht; dafür gibt es bewusst kein Werkzeug. Mails werden beim Lesen nicht als gelesen markiert. Anhänge werden zum Lesen kurz in ein temporäres Verzeichnis gespeichert und danach wieder gelöscht.
+Schreibend werden nur Entwürfe angelegt (neue Mail, Antwort, Weiterleitung) und ungesendete Entwürfe im Ordner Entwürfe geändert. Besprechungseinladungen werden vorbefüllt in einem Outlook-Fenster geöffnet, aber nicht gespeichert. Es wird nichts gesendet, verschoben oder gelöscht; dafür gibt es bewusst kein Werkzeug. Mails werden beim Lesen nicht als gelesen markiert. Anhänge werden zum Lesen kurz in ein temporäres Verzeichnis gespeichert und danach wieder gelöscht.
 
 ## Installation
 
@@ -27,6 +27,7 @@ Installiert wird der Server mit dem Skript `Install-ClaudeMcp.ps1` aus [mcp-inst
 | `create_reply_draft` | Antwort bzw. Allen antworten als Entwurf, Text über Signatur und Zitat |
 | `create_forward_draft` | Weiterleitung als Entwurf, mit den Anhängen der Originalmail |
 | `update_draft` | Betreff, Empfänger und Text eines ungesendeten Entwurfs im Ordner Entwürfe ändern |
+| `open_meeting_draft` | Besprechungseinladung vorbefüllt in einem Outlook-Fenster öffnen, ohne zu speichern |
 
 ### Entwürfe
 
@@ -37,6 +38,15 @@ Entwürfe werden mit `Save` im Ordner Entwürfe gespeichert, nie gesendet. Gesen
 - Die Standardsignatur fügt Outlook selbst ein, wie beim Verfassen einer Mail (Signatur für neue Mails bzw. für Antworten und Weiterleitungen).
 - `update_draft` bearbeitet nur ungesendete Mails im Standardordner Entwürfe eines Postfachs. Mit `body_mode` = `voranstellen` (Standard) kommt der Text über den bisherigen Inhalt, mit `ersetzen` wird der ganze Inhalt inklusive Signatur und Zitat ersetzt.
 - Die Originalmail wird beim Antworten oder Weiterleiten nicht verändert.
+
+### Besprechungseinladungen
+
+`open_meeting_draft` öffnet eine vorbefüllte Einladung (Betreff, Beginn, Ende bzw. Dauer, Ort, erforderliche und optionale Teilnehmende, Räume, Text) in einem Outlook-Fenster. Sie wird weder gespeichert noch gesendet: Gesendet oder gespeichert wird von Hand im Fenster, wird es ohne Speichern geschlossen, bleibt nichts zurück. Bis dahin blockiert sie keine Zeit im Kalender.
+
+- Ohne Teilnehmende und Räume entsteht ein einfacher Termin.
+- Eine Teams-Besprechung wird im Fenster über die Schaltfläche hinzugefügt (oder automatisch, wenn das in Teams für alle Besprechungen eingestellt ist).
+- Der Text wird als reiner Text übernommen.
+- Eine geöffnete Einladung kann der Server nicht mehr ändern, da sie keine `EntryID` hat. Korrekturen im Fenster vornehmen oder eine neue Einladung öffnen.
 
 ### Freigegebene Kalender und Frei/Gebucht
 
