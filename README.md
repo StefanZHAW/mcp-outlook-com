@@ -6,7 +6,7 @@ Es werden keine Elemente verändert, verschoben, gesendet oder gelöscht. Mails 
 
 ## Installation
 
-Installiert wird der Server mit dem Skript `Install-ClaudeMcp.ps1` aus [claude-desktop-install-mcp](https://gitlab.zhaw.ch/enterprise-applications/claude-desktop-install-mcp) (Komponente `outlook`). Das Skript holt mit Git den neuesten Stand von `main` aus diesem Repository, installiert die Abhängigkeiten aus `requirements.txt` und legt den Server unter `%USERPROFILE%\.mcp\outlook\outlook_mcp_server.py` ab.
+Installiert wird der Server mit dem Skript `Install-ClaudeMcp.ps1` aus [mcp-install-for-claude-desktop](https://gitlab.zhaw.ch/enterprise-applications/mcp-install-for-claude-desktop) (Komponente `outlook`). Das Skript holt mit Git den neuesten Stand von `main` aus diesem Repository, installiert die Abhängigkeiten aus `requirements.txt` und legt den Server unter `%USERPROFILE%\.mcp\outlook\outlook_mcp_server.py` ab.
 
 **Jeder Push auf `main` gelangt bei der nächsten Ausführung des Installationsskripts auf alle Rechner.** Änderungen deshalb vorher testen.
 
@@ -39,7 +39,7 @@ Installiert wird der Server mit dem Skript `Install-ClaudeMcp.ps1` aus [claude-d
 | `OUTLOOK_MCP_MAX_IMAGE_EDGE` | 1568 | Längste Kante verkleinerter Bilder (Pixel) |
 | `OUTLOOK_MCP_DATE_FORMAT` | leer | Datumsformat für Kalenderfilter, leer = kurzes Datumsformat von Windows. Bei Problemen z. B. `%d.%m.%Y %H:%M` |
 
-Beispiel und Hinweise zum Eintragen: siehe README von [claude-desktop-install-mcp](https://gitlab.zhaw.ch/enterprise-applications/claude-desktop-install-mcp).
+Beispiel und Hinweise zum Eintragen: siehe README von [mcp-install-for-claude-desktop](https://gitlab.zhaw.ch/enterprise-applications/mcp-install-for-claude-desktop).
 
 ## Voraussetzungen
 
