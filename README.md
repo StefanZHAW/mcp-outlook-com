@@ -1,8 +1,8 @@
 # mcp-outlook-com
 
-MCP-Server des Teams Enterprise Applications für **Claude Desktop**: lesender Zugriff auf E-Mails, Kalender und Anhänge im **klassischen Outlook** über das COM-Objektmodell.
+MCP-Server des Teams Enterprise Applications für **Claude Desktop**: lesender Zugriff auf E-Mails, Kalender und Anhänge im **klassischen Outlook** über das COM-Objektmodell, dazu das Anlegen von E-Mail-Entwürfen.
 
-Es werden keine Elemente verändert, verschoben, gesendet oder gelöscht. Mails werden beim Lesen nicht als gelesen markiert. Anhänge werden zum Lesen kurz in ein temporäres Verzeichnis gespeichert und danach wieder gelöscht.
+Schreibend werden nur Entwürfe angelegt (neue Mail, Antwort, Weiterleitung) und ungesendete Entwürfe im Ordner Entwürfe geändert. Es wird nichts gesendet, verschoben oder gelöscht; dafür gibt es bewusst kein Werkzeug. Mails werden beim Lesen nicht als gelesen markiert. Anhänge werden zum Lesen kurz in ein temporäres Verzeichnis gespeichert und danach wieder gelöscht.
 
 ## Installation
 
@@ -23,6 +23,20 @@ Installiert wird der Server mit dem Skript `Install-ClaudeMcp.ps1` aus [mcp-inst
 | `get_event` | Einen Termin mit Teilnehmenden, Antworten und Beschreibung lesen |
 | `get_free_busy` | Belegte Zeiten von Personen oder Räumen (beschäftigt, mit Vorbehalt, abwesend, anderswo tätig), ohne Betreff und Ort |
 | `find_meeting_times` | Zeitfenster, in denen alle Teilnehmenden frei sind, mit Mindestdauer und Tageszeitfenster |
+| `create_draft` | Neue Mail als Entwurf, mit Standardsignatur |
+| `create_reply_draft` | Antwort bzw. Allen antworten als Entwurf, Text über Signatur und Zitat |
+| `create_forward_draft` | Weiterleitung als Entwurf, mit den Anhängen der Originalmail |
+| `update_draft` | Betreff, Empfänger und Text eines ungesendeten Entwurfs im Ordner Entwürfe ändern |
+
+### Entwürfe
+
+Entwürfe werden mit `Save` im Ordner Entwürfe gespeichert, nie gesendet. Gesendet wird nur von Hand in Outlook. Mit `open_in_outlook` öffnet sich der Entwurf zusätzlich in einem Outlook-Fenster zum Prüfen.
+
+- Der Text (`body`) wird als HTML eingefügt, Zeilenumbrüche bleiben erhalten. Mit `body_is_html` kann ein HTML-Fragment übergeben werden.
+- Die Schrift (Standard Aptos 12 pt) wird direkt an jedem Absatz gesetzt. Sonst gälte die Formatvorlage der Mail, die bei Antworten von der Originalmail stammt und je nach Outlook-Version abweicht. Eigene Schriftangaben in einem HTML-Fragment haben Vorrang.
+- Die Standardsignatur fügt Outlook selbst ein, wie beim Verfassen einer Mail (Signatur für neue Mails bzw. für Antworten und Weiterleitungen).
+- `update_draft` bearbeitet nur ungesendete Mails im Standardordner Entwürfe eines Postfachs. Mit `body_mode` = `voranstellen` (Standard) kommt der Text über den bisherigen Inhalt, mit `ersetzen` wird der ganze Inhalt inklusive Signatur und Zitat ersetzt.
+- Die Originalmail wird beim Antworten oder Weiterleiten nicht verändert.
 
 ### Freigegebene Kalender und Frei/Gebucht
 
@@ -51,6 +65,8 @@ Zu beachten:
 | `OUTLOOK_MCP_MAX_ATTACHMENT_CHARS` | 30000 | Textmenge pro Aufruf von `get_attachment` |
 | `OUTLOOK_MCP_MAX_IMAGE_BYTES` | 3500000 | Grössere Bilder werden verkleinert |
 | `OUTLOOK_MCP_MAX_IMAGE_EDGE` | 1568 | Längste Kante verkleinerter Bilder (Pixel) |
+| `OUTLOOK_MCP_DRAFT_FONT` | Aptos | Schriftart für den Text von Entwürfen, leer = Formatvorlage der Mail |
+| `OUTLOOK_MCP_DRAFT_FONT_SIZE` | 12 | Schriftgrösse (pt) für den Text von Entwürfen |
 | `OUTLOOK_MCP_DATE_FORMAT` | leer | Datumsformat für Kalenderfilter, leer = kurzes Datumsformat von Windows. Bei Problemen z. B. `%d.%m.%Y %H:%M` |
 
 Beispiel und Hinweise zum Eintragen: siehe README von [mcp-install-for-claude-desktop](https://gitlab.zhaw.ch/enterprise-applications/mcp-install-for-claude-desktop).

@@ -1,12 +1,14 @@
 """
-Outlook MCP Server (nur lesend) für Claude Desktop.
+Outlook MCP Server für Claude Desktop.
 
 Greift über das COM-Objektmodell auf das klassische Outlook zu und
 stellt Werkzeuge zum Lesen und Durchsuchen von E-Mails,
-Kalendereinträgen und Anhängen bereit. Es werden keine Elemente
-verändert, verschoben, gesendet oder gelöscht. Anhänge werden zum
-Lesen kurz in ein temporäres Verzeichnis gespeichert und danach
-wieder gelöscht.
+Kalendereinträgen und Anhängen bereit. Schreibend werden nur
+E-Mail-Entwürfe angelegt (neu, Antwort, Weiterleitung) und
+ungesendete Entwürfe im Ordner Entwürfe bearbeitet. Es wird nichts
+gesendet, verschoben oder gelöscht; dafür gibt es bewusst kein
+Werkzeug. Anhänge werden zum Lesen kurz in ein temporäres
+Verzeichnis gespeichert und danach wieder gelöscht.
 
 Voraussetzungen: Windows, klassisches Outlook (das neue Outlook
 unterstützt kein COM), Python-Pakete "mcp", "pywin32", "pypdf",
@@ -74,6 +76,11 @@ MAX_ATTACHMENT_CHARS = _env_int("OUTLOOK_MCP_MAX_ATTACHMENT_CHARS", 30000)
 # mehr als ca. 1568 Pixel Kantenlänge ohnehin herunter.
 MAX_IMAGE_BYTES = _env_int("OUTLOOK_MCP_MAX_IMAGE_BYTES", 3_500_000)
 MAX_IMAGE_EDGE = _env_int("OUTLOOK_MCP_MAX_IMAGE_EDGE", 1568)
+# Schrift für den Text von Entwürfen, direkt am Absatz gesetzt, damit
+# sie in jedem Outlook gleich erscheint. Leere Schriftart = Formatvorlage
+# der Mail (bei Antworten oft die Schrift der Originalmail).
+DRAFT_FONT = os.environ.get("OUTLOOK_MCP_DRAFT_FONT", "Aptos").strip().strip('"')
+DRAFT_FONT_SIZE = _env_int("OUTLOOK_MCP_DRAFT_FONT_SIZE", 12)
 # Datumsformat für Kalenderfilter. Leer = kurzes Datumsformat von Windows.
 # Beispiel bei Problemen: "%d.%m.%Y %H:%M"
 CALENDAR_DATE_FORMAT = os.environ.get("OUTLOOK_MCP_DATE_FORMAT", "")
@@ -93,8 +100,13 @@ DEFAULT_FOLDERS = {
 }
 FOLDER_INBOX = 6
 FOLDER_CALENDAR = 9
+FOLDER_DRAFTS = 16
 ITEM_TYPE_MAIL = 0
 ITEM_TYPE_APPOINTMENT = 1
+CLASS_MAIL = 43
+FORMAT_HTML = 2
+CLOSE_DISCARD = 1
+RECIPIENT_TO, RECIPIENT_CC, RECIPIENT_BCC = 1, 2, 3
 
 PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
 PR_SENDER_SMTP = "http://schemas.microsoft.com/mapi/proptag/0x5D01001F"
@@ -859,6 +871,219 @@ def _find_meeting_times_impl(emails, duration_minutes, start_date, end_date,
 
 
 # ============================================================
+# Entwürfe
+# Entwürfe werden nur gespeichert (Save), nie gesendet. Senden,
+# Verschieben und Löschen bleiben der Benutzerin bzw. dem
+# Benutzer in Outlook vorbehalten.
+# ============================================================
+
+# Beginn des Inhalts: nach <body>, bei Mails aus dem Outlook-Editor
+# zusätzlich nach <div class=WordSection1>.
+BODY_START = re.compile(
+    r"<body\b[^>]*>(\s*<div\s+class=\"?WordSection1\"?[^>]*>)?", re.I)
+BODY_MODES = ("voranstellen", "ersetzen")
+BLOCK_TAG = re.compile(r"<(p|li|td|th|div|h[1-6])\b([^>]*)>", re.I)
+STYLE_ATTR = re.compile(r"""\bstyle\s*=\s*(["'])""", re.I)
+
+
+def _font_css() -> str:
+    if not DRAFT_FONT:
+        return ""
+    return (f"font-family:&quot;{html.escape(DRAFT_FONT)}&quot;,sans-serif;"
+            f"font-size:{max(6, min(DRAFT_FONT_SIZE, 72))}.0pt")
+
+
+def _with_font(fragment: str) -> str:
+    """Schrift an jedem Block setzen. Die Formatvorlage der Mail legt
+    die Schrift für Absätze fest, ein umschliessendes Element genügt
+    deshalb nicht. Eigene Angaben im Fragment haben Vorrang."""
+    css = _font_css()
+    if not css:
+        return fragment
+
+    def add(match):
+        tag, attrs = match.group(1), match.group(2)
+        style = STYLE_ATTR.search(attrs)
+        if style:
+            attrs = attrs[:style.end()] + css + ";" + attrs[style.end():]
+        else:
+            attrs = f' style="{css}"' + attrs
+        return f"<{tag}{attrs}>"
+
+    return f'<div style="{css}">' + BLOCK_TAG.sub(add, fragment) + "</div>"
+
+
+def _body_html(text: str, is_html: bool) -> str:
+    if is_html:
+        return _with_font(text or "")
+    # Absätze im Stil der Outlook-Vorlage (Abstände), Schrift aus _with_font.
+    lines = (text or "").replace("\r\n", "\n").strip("\n").split("\n")
+    return _with_font("".join(
+        f"<p class=MsoNormal>{html.escape(line) if line.strip() else '&nbsp;'}</p>"
+        for line in lines))
+
+
+def _insert_body(item, fragment: str, mode: str) -> None:
+    """Text am Anfang des Inhalts einfügen (vor Signatur und Zitat)
+    oder den ganzen Inhalt ersetzen. Kopf und Formatvorlagen bleiben."""
+    # Format nur bei Bedarf setzen: Erneutes Setzen verwirft eine
+    # gerade eingefügte Signatur.
+    if _safe(item, "BodyFormat") != FORMAT_HTML:
+        item.BodyFormat = FORMAT_HTML
+    body = _safe(item, "HTMLBody", "") or ""
+    match = BODY_START.search(body)
+    if mode == "ersetzen":
+        if match:
+            closing = "</div></body></html>" if match.group(1) else "</body></html>"
+            body = body[:match.end()] + fragment + closing
+        else:
+            body = f"<html><body>{fragment}</body></html>"
+    elif match:
+        body = body[:match.end()] + fragment + body[match.end():]
+    else:
+        body = fragment + body
+    item.HTMLBody = body
+
+
+def _with_signature(item):
+    """HTML-Format setzen und die Standardsignatur einfügen lassen.
+    Outlook fügt sie ein, sobald das Element ein Fenster-Objekt
+    erhält, auch wenn dieses nicht angezeigt wird. Der Inhalt wird
+    danach sofort gelesen, damit spätere Änderungen sie nicht verwerfen."""
+    item.BodyFormat = FORMAT_HTML
+    try:
+        item.GetInspector
+        item.HTMLBody
+    except Exception as exc:
+        log.warning("Signatur konnte nicht eingefügt werden: %s", exc)
+    return item
+
+
+def _set_recipients(item, kind: int, addresses, replace: bool) -> None:
+    addresses = _mailboxes(addresses)
+    if replace and addresses:
+        recipients = item.Recipients
+        for nr in range(int(recipients.Count), 0, -1):
+            if _safe(recipients.Item(nr), "Type") == kind:
+                recipients.Remove(nr)
+    for address in addresses:
+        item.Recipients.Add(address).Type = kind
+
+
+def _unresolved(item) -> list[str]:
+    try:
+        item.Recipients.ResolveAll()
+        return [_safe(r, "Name", "") for r in item.Recipients
+                if not _safe(r, "Resolved", False)]
+    except Exception:
+        return []
+
+
+def _open_mail(entry_id: str, store_id: str):
+    item = _open_item(entry_id, store_id)
+    if _safe(item, "Class") != CLASS_MAIL:
+        raise ValueError("Das Element ist keine E-Mail. Entwürfe sind nur "
+                         "für E-Mails möglich.")
+    return item
+
+
+def _save_draft(item, open_in_outlook: bool) -> dict:
+    unresolved = _unresolved(item)
+    item.Save()
+    folder = _safe(item, "Parent")
+    result = {
+        "entry_id": _safe(item, "EntryID", ""),
+        "store_id": _safe(folder, "StoreID", ""),
+        "betreff": _safe(item, "Subject", ""),
+        "an": _safe(item, "To", ""),
+        "cc": _safe(item, "CC", ""),
+        "bcc": _safe(item, "BCC", ""),
+        "ordner": _folder_path(folder),
+        "anhaenge": [a["name"] for a in _attachment_list(item)],
+        "vorschau": _truncate(_safe(item, "Body", ""), 1000),
+        "hinweis": ("Entwurf gespeichert, nicht gesendet. Gesendet wird "
+                    "nur von Hand in Outlook."),
+    }
+    if unresolved:
+        result["nicht_aufgeloest"] = unresolved
+    if open_in_outlook:
+        item.Display(False)
+    else:
+        try:
+            item.Close(CLOSE_DISCARD)  # unsichtbares Fenster-Objekt freigeben
+        except Exception:
+            pass
+    return result
+
+
+def _body_mode(mode: str) -> str:
+    mode = (mode or "voranstellen").strip().lower()
+    if mode not in BODY_MODES:
+        raise ValueError("body_mode muss 'voranstellen' oder 'ersetzen' sein.")
+    return mode
+
+
+def _create_draft_impl(to, cc, bcc, subject, body, body_is_html,
+                       open_in_outlook) -> dict:
+    item = _with_signature(_namespace().Application.CreateItem(ITEM_TYPE_MAIL))
+    item.Subject = subject or ""
+    _set_recipients(item, RECIPIENT_TO, to, False)
+    _set_recipients(item, RECIPIENT_CC, cc, False)
+    _set_recipients(item, RECIPIENT_BCC, bcc, False)
+    if body:
+        _insert_body(item, _body_html(body, body_is_html), "voranstellen")
+    return _save_draft(item, open_in_outlook)
+
+
+def _create_reply_draft_impl(entry_id, store_id, body, body_is_html, reply_all,
+                             cc, bcc, open_in_outlook) -> dict:
+    original = _open_mail(entry_id, store_id)
+    item = _with_signature(original.ReplyAll() if reply_all else original.Reply())
+    _set_recipients(item, RECIPIENT_CC, cc, False)
+    _set_recipients(item, RECIPIENT_BCC, bcc, False)
+    if body:
+        _insert_body(item, _body_html(body, body_is_html), "voranstellen")
+    return _save_draft(item, open_in_outlook)
+
+
+def _create_forward_draft_impl(entry_id, store_id, to, cc, bcc, body,
+                               body_is_html, open_in_outlook) -> dict:
+    item = _with_signature(_open_mail(entry_id, store_id).Forward())
+    _set_recipients(item, RECIPIENT_TO, to, False)
+    _set_recipients(item, RECIPIENT_CC, cc, False)
+    _set_recipients(item, RECIPIENT_BCC, bcc, False)
+    if body:
+        _insert_body(item, _body_html(body, body_is_html), "voranstellen")
+    return _save_draft(item, open_in_outlook)
+
+
+def _update_draft_impl(entry_id, store_id, subject, to, cc, bcc, body,
+                       body_mode, body_is_html, open_in_outlook) -> dict:
+    mode = _body_mode(body_mode)
+    item = _open_mail(entry_id, store_id)
+    if _safe(item, "Sent", True):
+        raise ValueError("Gesendete oder empfangene Mails können nicht "
+                         "bearbeitet werden, nur ungesendete Entwürfe.")
+    folder = item.Parent
+    drafts = folder.Store.GetDefaultFolder(FOLDER_DRAFTS)
+    if not _namespace().CompareEntryIDs(folder.EntryID, drafts.EntryID):
+        raise ValueError("Bearbeitet werden nur Elemente im Ordner Entwürfe "
+                         f"(dieses liegt in '{_folder_path(folder)}').")
+
+    changes = [subject, _mailboxes(to), _mailboxes(cc), _mailboxes(bcc), body]
+    if not any(changes) and not open_in_outlook:
+        raise ValueError("Keine Änderung angegeben.")
+    if subject:
+        item.Subject = subject
+    _set_recipients(item, RECIPIENT_TO, to, True)
+    _set_recipients(item, RECIPIENT_CC, cc, True)
+    _set_recipients(item, RECIPIENT_BCC, bcc, True)
+    if body:
+        _insert_body(item, _body_html(body, body_is_html), mode)
+    return _save_draft(item, open_in_outlook)
+
+
+# ============================================================
 # Anhänge
 # Der Anhang wird in ein eigenes temporäres Verzeichnis unter
 # festem Namen gespeichert (kein Pfad aus dem Dateinamen), der
@@ -1202,12 +1427,16 @@ def _get_attachment_impl(entry_id, store_id, index, name, offset, max_chars):
 mcp = FastMCP(
     "outlook",
     instructions=(
-        "Lesender Zugriff auf E-Mails und Kalender im klassischen Outlook. "
-        "Erst mit search_mails bzw. list_events suchen, dann Details mit "
-        "get_mail bzw. get_event abrufen. Anhänge mit get_attachment lesen "
-        "(Nummer 'nr' aus get_mail). Für die Verfügbarkeit anderer Personen "
-        "get_free_busy, für gemeinsame freie Zeiten find_meeting_times "
-        "verwenden. Datumsangaben im Format JJJJ-MM-TT."
+        "Lesender Zugriff auf E-Mails und Kalender im klassischen Outlook, "
+        "dazu E-Mail-Entwürfe. Erst mit search_mails bzw. list_events "
+        "suchen, dann Details mit get_mail bzw. get_event abrufen. Anhänge "
+        "mit get_attachment lesen (Nummer 'nr' aus get_mail). Für die "
+        "Verfügbarkeit anderer Personen get_free_busy, für gemeinsame freie "
+        "Zeiten find_meeting_times verwenden. Entwürfe mit create_draft, "
+        "create_reply_draft und create_forward_draft anlegen und mit "
+        "update_draft ändern. Senden und Löschen ist nicht möglich: "
+        "Entwürfe sendet die Benutzerin bzw. der Benutzer selbst in "
+        "Outlook. Datumsangaben im Format JJJJ-MM-TT."
     ),
 )
 
@@ -1394,12 +1623,121 @@ async def find_meeting_times(
                       include_weekends, allow_tentative, interval_minutes, limit)
 
 
+@mcp.tool()
+async def create_draft(
+    to: list[str] | None = None,
+    subject: str = "",
+    body: str = "",
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
+    body_is_html: bool = False,
+    open_in_outlook: bool = False,
+) -> dict:
+    """Legt eine neue E-Mail als Entwurf im Ordner Entwürfe an, mit der
+    Standardsignatur aus Outlook. Die Mail wird nicht gesendet.
+
+    to / cc / bcc: E-Mail-Adressen der Empfängerinnen und Empfänger.
+    subject: Betreff.
+    body: Text der Mail, Zeilenumbrüche werden übernommen. Steht über
+        der Signatur.
+    body_is_html: body ist ein HTML-Fragment (z. B. mit <p>, <b>, <ul>).
+    open_in_outlook: Entwurf zusätzlich in einem Outlook-Fenster öffnen.
+    """
+    return await _run(_create_draft_impl, to, cc, bcc, subject, body,
+                      body_is_html, open_in_outlook)
+
+
+@mcp.tool()
+async def create_reply_draft(
+    entry_id: str,
+    body: str = "",
+    store_id: str = "",
+    reply_all: bool = False,
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
+    body_is_html: bool = False,
+    open_in_outlook: bool = False,
+) -> dict:
+    """Legt eine Antwort auf eine E-Mail als Entwurf an, wie "Antworten"
+    bzw. "Allen antworten" in Outlook: Empfänger und Betreff werden
+    übernommen, der Text steht über Signatur und zitierter Mail. Die
+    Antwort wird nicht gesendet, die Originalmail nicht verändert.
+
+    entry_id / store_id: Werte aus search_mails.
+    body: Text der Antwort, Zeilenumbrüche werden übernommen.
+    reply_all: An alle Empfängerinnen und Empfänger antworten.
+    cc / bcc: Zusätzliche E-Mail-Adressen.
+    body_is_html: body ist ein HTML-Fragment.
+    open_in_outlook: Entwurf zusätzlich in einem Outlook-Fenster öffnen.
+    """
+    return await _run(_create_reply_draft_impl, entry_id, store_id, body,
+                      body_is_html, reply_all, cc, bcc, open_in_outlook)
+
+
+@mcp.tool()
+async def create_forward_draft(
+    entry_id: str,
+    to: list[str] | None = None,
+    body: str = "",
+    store_id: str = "",
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
+    body_is_html: bool = False,
+    open_in_outlook: bool = False,
+) -> dict:
+    """Legt eine Weiterleitung einer E-Mail als Entwurf an, mit allen
+    Anhängen der Originalmail. Der Text steht über Signatur und
+    weitergeleiteter Mail. Die Weiterleitung wird nicht gesendet.
+
+    entry_id / store_id: Werte aus search_mails.
+    to / cc / bcc: E-Mail-Adressen der Empfängerinnen und Empfänger.
+    body: Begleittext, Zeilenumbrüche werden übernommen.
+    body_is_html: body ist ein HTML-Fragment.
+    open_in_outlook: Entwurf zusätzlich in einem Outlook-Fenster öffnen.
+    """
+    return await _run(_create_forward_draft_impl, entry_id, store_id, to, cc,
+                      bcc, body, body_is_html, open_in_outlook)
+
+
+@mcp.tool()
+async def update_draft(
+    entry_id: str,
+    store_id: str = "",
+    subject: str = "",
+    to: list[str] | None = None,
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
+    body: str = "",
+    body_mode: str = "voranstellen",
+    body_is_html: bool = False,
+    open_in_outlook: bool = False,
+) -> dict:
+    """Ändert einen ungesendeten Entwurf im Ordner Entwürfe. Leere
+    Parameter lassen das jeweilige Feld unverändert. Andere Mails
+    können nicht bearbeitet werden. Der Entwurf wird nicht gesendet.
+
+    entry_id / store_id: Werte aus create_draft, create_reply_draft,
+        create_forward_draft oder search_mails (folder='Entwürfe').
+    subject: Neuer Betreff.
+    to / cc / bcc: Ersetzen die bisherigen Adressen des jeweiligen Felds.
+    body: Text, Zeilenumbrüche werden übernommen.
+    body_mode: 'voranstellen' fügt body am Anfang ein (über dem bisherigen
+        Text), 'ersetzen' ersetzt den ganzen Inhalt inklusive Signatur
+        und zitierter Mail.
+    body_is_html: body ist ein HTML-Fragment.
+    open_in_outlook: Entwurf in einem Outlook-Fenster öffnen, auch ohne
+        weitere Änderung.
+    """
+    return await _run(_update_draft_impl, entry_id, store_id, subject, to, cc,
+                      bcc, body, body_mode, body_is_html, open_in_outlook)
+
+
 def main() -> None:
     try:
         locale.setlocale(locale.LC_TIME, "")
     except locale.Error:
         log.warning("Systemgebietsschema konnte nicht gesetzt werden")
-    log.info("Outlook MCP Server startet (nur lesend)")
+    log.info("Outlook MCP Server startet (lesend, Entwürfe ohne Senden)")
     mcp.run()
 
 
