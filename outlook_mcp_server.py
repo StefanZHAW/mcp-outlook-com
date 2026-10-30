@@ -102,7 +102,6 @@ DEFAULT_FOLDERS = {
 }
 FOLDER_INBOX = 6
 FOLDER_CALENDAR = 9
-FOLDER_DRAFTS = 16
 ITEM_TYPE_MAIL = 0
 ITEM_TYPE_APPOINTMENT = 1
 CLASS_MAIL = 43
@@ -885,7 +884,6 @@ def _find_meeting_times_impl(emails, duration_minutes, start_date, end_date,
 # zusätzlich nach <div class=WordSection1>.
 BODY_START = re.compile(
     r"<body\b[^>]*>(\s*<div\s+class=\"?WordSection1\"?[^>]*>)?", re.I)
-BODY_MODES = ("voranstellen", "ersetzen")
 BLOCK_TAG = re.compile(r"<(p|li|td|th|div|h[1-6])\b([^>]*)>", re.I)
 STYLE_ATTR = re.compile(r"""\bstyle\s*=\s*(["'])""", re.I)
 
@@ -927,22 +925,16 @@ def _body_html(text: str, is_html: bool) -> str:
         for line in lines))
 
 
-def _insert_body(item, fragment: str, mode: str) -> None:
-    """Text am Anfang des Inhalts einfügen (vor Signatur und Zitat)
-    oder den ganzen Inhalt ersetzen. Kopf und Formatvorlagen bleiben."""
+def _insert_body(item, fragment: str) -> None:
+    """Text am Anfang des Inhalts einfügen (vor Signatur und Zitat).
+    Kopf und Formatvorlagen bleiben."""
     # Format nur bei Bedarf setzen: Erneutes Setzen verwirft eine
     # gerade eingefügte Signatur.
     if _safe(item, "BodyFormat") != FORMAT_HTML:
         item.BodyFormat = FORMAT_HTML
     body = _safe(item, "HTMLBody", "") or ""
     match = BODY_START.search(body)
-    if mode == "ersetzen":
-        if match:
-            closing = "</div></body></html>" if match.group(1) else "</body></html>"
-            body = body[:match.end()] + fragment + closing
-        else:
-            body = f"<html><body>{fragment}</body></html>"
-    elif match:
+    if match:
         body = body[:match.end()] + fragment + body[match.end():]
     else:
         body = fragment + body
@@ -963,14 +955,8 @@ def _with_signature(item):
     return item
 
 
-def _set_recipients(item, kind: int, addresses, replace: bool) -> None:
-    addresses = _mailboxes(addresses)
-    if replace and addresses:
-        recipients = item.Recipients
-        for nr in range(int(recipients.Count), 0, -1):
-            if _safe(recipients.Item(nr), "Type") == kind:
-                recipients.Remove(nr)
-    for address in addresses:
+def _set_recipients(item, kind: int, addresses) -> None:
+    for address in _mailboxes(addresses):
         item.Recipients.Add(address).Type = kind
 
 
@@ -1020,22 +1006,15 @@ def _save_draft(item, open_in_outlook: bool) -> dict:
     return result
 
 
-def _body_mode(mode: str) -> str:
-    mode = (mode or "voranstellen").strip().lower()
-    if mode not in BODY_MODES:
-        raise ValueError("body_mode muss 'voranstellen' oder 'ersetzen' sein.")
-    return mode
-
-
 def _create_draft_impl(to, cc, bcc, subject, body, body_is_html,
                        open_in_outlook) -> dict:
     item = _with_signature(_namespace().Application.CreateItem(ITEM_TYPE_MAIL))
     item.Subject = subject or ""
-    _set_recipients(item, RECIPIENT_TO, to, False)
-    _set_recipients(item, RECIPIENT_CC, cc, False)
-    _set_recipients(item, RECIPIENT_BCC, bcc, False)
+    _set_recipients(item, RECIPIENT_TO, to)
+    _set_recipients(item, RECIPIENT_CC, cc)
+    _set_recipients(item, RECIPIENT_BCC, bcc)
     if body:
-        _insert_body(item, _body_html(body, body_is_html), "voranstellen")
+        _insert_body(item, _body_html(body, body_is_html))
     return _save_draft(item, open_in_outlook)
 
 
@@ -1043,47 +1022,21 @@ def _create_reply_draft_impl(entry_id, store_id, body, body_is_html, reply_all,
                              cc, bcc, open_in_outlook) -> dict:
     original = _open_mail(entry_id, store_id)
     item = _with_signature(original.ReplyAll() if reply_all else original.Reply())
-    _set_recipients(item, RECIPIENT_CC, cc, False)
-    _set_recipients(item, RECIPIENT_BCC, bcc, False)
+    _set_recipients(item, RECIPIENT_CC, cc)
+    _set_recipients(item, RECIPIENT_BCC, bcc)
     if body:
-        _insert_body(item, _body_html(body, body_is_html), "voranstellen")
+        _insert_body(item, _body_html(body, body_is_html))
     return _save_draft(item, open_in_outlook)
 
 
 def _create_forward_draft_impl(entry_id, store_id, to, cc, bcc, body,
                                body_is_html, open_in_outlook) -> dict:
     item = _with_signature(_open_mail(entry_id, store_id).Forward())
-    _set_recipients(item, RECIPIENT_TO, to, False)
-    _set_recipients(item, RECIPIENT_CC, cc, False)
-    _set_recipients(item, RECIPIENT_BCC, bcc, False)
+    _set_recipients(item, RECIPIENT_TO, to)
+    _set_recipients(item, RECIPIENT_CC, cc)
+    _set_recipients(item, RECIPIENT_BCC, bcc)
     if body:
-        _insert_body(item, _body_html(body, body_is_html), "voranstellen")
-    return _save_draft(item, open_in_outlook)
-
-
-def _update_draft_impl(entry_id, store_id, subject, to, cc, bcc, body,
-                       body_mode, body_is_html, open_in_outlook) -> dict:
-    mode = _body_mode(body_mode)
-    item = _open_mail(entry_id, store_id)
-    if _safe(item, "Sent", True):
-        raise ValueError("Gesendete oder empfangene Mails können nicht "
-                         "bearbeitet werden, nur ungesendete Entwürfe.")
-    folder = item.Parent
-    drafts = folder.Store.GetDefaultFolder(FOLDER_DRAFTS)
-    if not _namespace().CompareEntryIDs(folder.EntryID, drafts.EntryID):
-        raise ValueError("Bearbeitet werden nur Elemente im Ordner Entwürfe "
-                         f"(dieses liegt in '{_folder_path(folder)}').")
-
-    changes = [subject, _mailboxes(to), _mailboxes(cc), _mailboxes(bcc), body]
-    if not any(changes) and not open_in_outlook:
-        raise ValueError("Keine Änderung angegeben.")
-    if subject:
-        item.Subject = subject
-    _set_recipients(item, RECIPIENT_TO, to, True)
-    _set_recipients(item, RECIPIENT_CC, cc, True)
-    _set_recipients(item, RECIPIENT_BCC, bcc, True)
-    if body:
-        _insert_body(item, _body_html(body, body_is_html), mode)
+        _insert_body(item, _body_html(body, body_is_html))
     return _save_draft(item, open_in_outlook)
 
 
@@ -1127,9 +1080,9 @@ def _open_meeting_draft_impl(subject, start, end, duration_minutes, location,
         item.Location = location
     if body:
         item.Body = body
-    _set_recipients(item, RECIPIENT_REQUIRED, required, False)
-    _set_recipients(item, RECIPIENT_OPTIONAL, optional, False)
-    _set_recipients(item, RECIPIENT_RESOURCE, rooms, False)
+    _set_recipients(item, RECIPIENT_REQUIRED, required)
+    _set_recipients(item, RECIPIENT_OPTIONAL, optional)
+    _set_recipients(item, RECIPIENT_RESOURCE, rooms)
     unresolved = []
     if int(item.Recipients.Count):
         item.MeetingStatus = MEETING_ORGANIZER
@@ -1505,8 +1458,8 @@ mcp = FastMCP(
         "mit get_attachment lesen (Nummer 'nr' aus get_mail). Für die "
         "Verfügbarkeit anderer Personen get_free_busy, für gemeinsame freie "
         "Zeiten find_meeting_times verwenden. Entwürfe mit create_draft, "
-        "create_reply_draft und create_forward_draft anlegen und mit "
-        "update_draft ändern. Besprechungseinladungen öffnet "
+        "create_reply_draft und create_forward_draft anlegen. "
+        "Besprechungseinladungen öffnet "
         "open_meeting_draft vorbefüllt in einem Outlook-Fenster, ohne zu "
         "speichern. Senden und Löschen ist nicht möglich: Entwürfe und "
         "Einladungen sendet die Benutzerin bzw. der Benutzer selbst in "
@@ -1771,39 +1724,6 @@ async def create_forward_draft(
     """
     return await _run(_create_forward_draft_impl, entry_id, store_id, to, cc,
                       bcc, body, body_is_html, open_in_outlook)
-
-
-@mcp.tool()
-async def update_draft(
-    entry_id: str,
-    store_id: str = "",
-    subject: str = "",
-    to: list[str] | None = None,
-    cc: list[str] | None = None,
-    bcc: list[str] | None = None,
-    body: str = "",
-    body_mode: str = "voranstellen",
-    body_is_html: bool = False,
-    open_in_outlook: bool = False,
-) -> dict:
-    """Ändert einen ungesendeten Entwurf im Ordner Entwürfe. Leere
-    Parameter lassen das jeweilige Feld unverändert. Andere Mails
-    können nicht bearbeitet werden. Der Entwurf wird nicht gesendet.
-
-    entry_id / store_id: Werte aus create_draft, create_reply_draft,
-        create_forward_draft oder search_mails (folder='Entwürfe').
-    subject: Neuer Betreff.
-    to / cc / bcc: Ersetzen die bisherigen Adressen des jeweiligen Felds.
-    body: Text, Zeilenumbrüche werden übernommen.
-    body_mode: 'voranstellen' fügt body am Anfang ein (über dem bisherigen
-        Text), 'ersetzen' ersetzt den ganzen Inhalt inklusive Signatur
-        und zitierter Mail.
-    body_is_html: body ist ein HTML-Fragment.
-    open_in_outlook: Entwurf in einem Outlook-Fenster öffnen, auch ohne
-        weitere Änderung.
-    """
-    return await _run(_update_draft_impl, entry_id, store_id, subject, to, cc,
-                      bcc, body, body_mode, body_is_html, open_in_outlook)
 
 
 @mcp.tool()
