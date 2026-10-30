@@ -1,0 +1,11 @@
+# Abhängigkeiten von outlook_mcp_server.py.
+# Install-ClaudeMcp.ps1 (claude-desktop-install-mcp) installiert diese Liste.
+#
+# mcp wird auf 1.x begrenzt, da Version 2 die API ändern kann.
+# pypdf und openpyxl lesen Text aus PDF- bzw. Excel-Anhängen,
+# pillow verkleinert grosse Bilder.
+mcp>=1.10,<2
+pywin32
+pypdf
+openpyxl
+pillow

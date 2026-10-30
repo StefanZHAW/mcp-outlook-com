@@ -1,0 +1,1116 @@
+"""
+Outlook MCP Server (nur lesend) für Claude Desktop.
+
+Greift über das COM-Objektmodell auf das klassische Outlook zu und
+stellt Werkzeuge zum Lesen und Durchsuchen von E-Mails,
+Kalendereinträgen und Anhängen bereit. Es werden keine Elemente
+verändert, verschoben, gesendet oder gelöscht. Anhänge werden zum
+Lesen kurz in ein temporäres Verzeichnis gespeichert und danach
+wieder gelöscht.
+
+Voraussetzungen: Windows, klassisches Outlook (das neue Outlook
+unterstützt kein COM), Python-Pakete "mcp", "pywin32", "pypdf",
+"openpyxl" und "pillow".
+"""
+
+from __future__ import annotations
+
+import asyncio
+import email
+import html
+import io
+import locale
+import logging
+import os
+import re
+import shutil
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from email import policy
+from typing import Any, Callable
+
+import pythoncom
+import pywintypes
+import win32com.client
+from mcp.server.fastmcp import FastMCP, Image
+
+# Protokoll ausschliesslich auf stderr: stdout gehört dem MCP-Protokoll.
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("outlook-mcp")
+
+
+# ============================================================
+# Konfiguration (über Umgebungsvariablen anpassbar)
+# ============================================================
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+MAX_RESULTS = _env_int("OUTLOOK_MCP_MAX_RESULTS", 50)
+MAX_BODY_CHARS = _env_int("OUTLOOK_MCP_MAX_BODY_CHARS", 8000)
+MAX_SCAN = _env_int("OUTLOOK_MCP_MAX_SCAN", 5000)
+MAX_CALENDAR_DAYS = _env_int("OUTLOOK_MCP_MAX_CALENDAR_DAYS", 366)
+PREVIEW_CHARS = _env_int("OUTLOOK_MCP_PREVIEW_CHARS", 200)
+MAX_ATTACHMENT_BYTES = _env_int("OUTLOOK_MCP_MAX_ATTACHMENT_BYTES", 30_000_000)
+# Textmenge pro Aufruf; längere Anhänge werden mit 'offset' weitergelesen.
+MAX_ATTACHMENT_CHARS = _env_int("OUTLOOK_MCP_MAX_ATTACHMENT_CHARS", 30000)
+# Die Claude-API nimmt Bilder bis 5 MB an, base64 macht sie ein Drittel
+# grösser. Grössere Bilder werden verkleinert; Claude skaliert Bilder mit
+# mehr als ca. 1568 Pixel Kantenlänge ohnehin herunter.
+MAX_IMAGE_BYTES = _env_int("OUTLOOK_MCP_MAX_IMAGE_BYTES", 3_500_000)
+MAX_IMAGE_EDGE = _env_int("OUTLOOK_MCP_MAX_IMAGE_EDGE", 1568)
+# Datumsformat für Kalenderfilter. Leer = kurzes Datumsformat von Windows.
+# Beispiel bei Problemen: "%d.%m.%Y %H:%M"
+CALENDAR_DATE_FORMAT = os.environ.get("OUTLOOK_MCP_DATE_FORMAT", "")
+
+
+# ============================================================
+# Outlook-Konstanten
+# ============================================================
+
+DEFAULT_FOLDERS = {
+    "posteingang": 6, "inbox": 6,
+    "gesendet": 5, "gesendete elemente": 5, "sent": 5,
+    "entwürfe": 16, "drafts": 16,
+    "gelöscht": 3, "gelöschte elemente": 3, "deleted": 3,
+    "junk": 23, "junk-e-mail": 23,
+    "kalender": 9, "calendar": 9,
+}
+FOLDER_INBOX = 6
+FOLDER_CALENDAR = 9
+ITEM_TYPE_MAIL = 0
+ITEM_TYPE_APPOINTMENT = 1
+
+PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001F"
+PR_SENDER_SMTP = "http://schemas.microsoft.com/mapi/proptag/0x5D01001F"
+PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+
+ATT_BY_VALUE = 1
+ATT_BY_REFERENCE = 4
+ATT_EMBEDDED = 5
+ATT_OLE = 6
+ATTACHMENT_TYPE = {ATT_BY_VALUE: "Datei", ATT_BY_REFERENCE: "Verknüpfung",
+                   ATT_EMBEDDED: "Outlook-Element", ATT_OLE: "OLE-Objekt"}
+
+IMPORTANCE = {0: "niedrig", 1: "normal", 2: "hoch"}
+BUSY_STATUS = {0: "frei", 1: "mit Vorbehalt", 2: "beschäftigt",
+               3: "abwesend", 4: "anderswo tätig"}
+MEETING_STATUS = {0: "Termin", 1: "Besprechung (Organisator)",
+                  3: "Besprechung (Einladung erhalten)", 5: "abgesagt",
+                  7: "abgesagt (Absage erhalten)"}
+RESPONSE_STATUS = {0: "keine", 1: "Organisator", 2: "mit Vorbehalt",
+                   3: "zugesagt", 4: "abgelehnt", 5: "noch nicht beantwortet"}
+RECIPIENT_TYPE = {1: "erforderlich", 2: "optional", 3: "Ressource"}
+
+
+# ============================================================
+# COM-Zugriff in einem eigenen Thread
+# COM-Objekte sind an den Thread gebunden, in dem sie erzeugt
+# wurden. Alle Outlook-Aufrufe laufen daher in genau einem
+# Worker-Thread mit initialisiertem COM.
+# ============================================================
+
+_executor = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="outlook-com",
+    initializer=pythoncom.CoInitialize,
+)
+_state: dict[str, Any] = {}
+
+
+def _namespace():
+    ns = _state.get("ns")
+    if ns is None:
+        app = win32com.client.Dispatch("Outlook.Application")
+        ns = app.GetNamespace("MAPI")
+        _state["ns"] = ns
+        log.info("Verbindung zu Outlook hergestellt")
+    return ns
+
+
+def _call(fn: Callable, *args):
+    try:
+        return fn(*args)
+    except pywintypes.com_error as exc:
+        # Outlook wurde evtl. neu gestartet: einmal neu verbinden.
+        log.warning("COM-Fehler, neuer Verbindungsversuch: %s", exc)
+        _state.clear()
+        try:
+            return fn(*args)
+        except pywintypes.com_error as exc2:
+            raise RuntimeError(f"Outlook-Zugriff fehlgeschlagen: {exc2}") from exc2
+
+
+async def _run(fn: Callable, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_executor, _call, fn, *args)
+
+
+# ============================================================
+# Hilfsfunktionen
+# ============================================================
+
+def _safe(obj, attr: str, default=None):
+    try:
+        value = getattr(obj, attr)
+        return default if value is None else value
+    except Exception:
+        return default
+
+
+def _dt(value) -> datetime | None:
+    """COM-Datum in ein naives lokales datetime umwandeln."""
+    if value is None:
+        return None
+    try:
+        dt = datetime(value.year, value.month, value.day,
+                      value.hour, value.minute, value.second)
+    except Exception:
+        return None
+    # Outlook verwendet 01.01.4501 als "kein Datum".
+    return None if dt.year >= 4500 else dt
+
+
+def _fmt(dt: datetime | None) -> str | None:
+    return dt.strftime("%Y-%m-%d %H:%M") if dt else None
+
+
+def _parse_date(text: str, name: str) -> datetime | None:
+    if not text or not text.strip():
+        return None
+    text = text.strip()
+    for pattern in ("%Y-%m-%d %H:%M", "%Y-%m-%d", "%d.%m.%Y %H:%M", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(text, pattern)
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Ungültiges Datum für '{name}': '{text}'. "
+        "Erlaubt: JJJJ-MM-TT, JJJJ-MM-TT HH:MM, TT.MM.JJJJ"
+    )
+
+
+def _has_time(text: str) -> bool:
+    return ":" in (text or "")
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = (text or "").replace("\r\n", "\n").strip()
+    if len(text) > limit:
+        rest = len(text) - limit
+        return text[:limit] + f"\n[… gekürzt, {rest} weitere Zeichen]"
+    return text
+
+
+def _limit(value: int) -> int:
+    return max(1, min(int(value or MAX_RESULTS), MAX_RESULTS))
+
+
+def _dasl_text(value: str) -> str:
+    # Hochkommas verdoppeln, LIKE-Platzhalter entfernen.
+    return value.replace("'", "''").replace("%", "")
+
+
+def _folder_path(folder) -> str:
+    return _safe(folder, "FolderPath", "") or _safe(folder, "Name", "")
+
+
+def _resolve_folder(path: str, default_id: int):
+    """Ordner über Kurzname (z. B. 'Posteingang') oder vollständigen
+    Pfad (z. B. '\\\\max@firma.ch\\Posteingang\\Projekte') auflösen."""
+    ns = _namespace()
+    if not path or not path.strip():
+        return ns.GetDefaultFolder(default_id)
+
+    key = path.strip().lower()
+    if key in DEFAULT_FOLDERS:
+        return ns.GetDefaultFolder(DEFAULT_FOLDERS[key])
+
+    parts = [p for p in path.strip().strip("\\").split("\\") if p]
+    current = None
+    collection = ns.Folders
+    for part in parts:
+        match = None
+        for candidate in collection:
+            if (_safe(candidate, "Name", "") or "").lower() == part.lower():
+                match = candidate
+                break
+        if match is None:
+            raise ValueError(
+                f"Ordner nicht gefunden: '{part}' (Pfad '{path}'). "
+                "Gültige Pfade liefern list_folders bzw. list_calendars."
+            )
+        current = match
+        collection = match.Folders
+    if current is None:
+        raise ValueError(f"Ungültiger Ordnerpfad: '{path}'")
+    return current
+
+
+def _shared_calendar(mailbox: str):
+    ns = _namespace()
+    recipient = ns.CreateRecipient(mailbox)
+    recipient.Resolve()
+    if not recipient.Resolved:
+        raise ValueError(f"Postfach konnte nicht aufgelöst werden: '{mailbox}'")
+    try:
+        return ns.GetSharedDefaultFolder(recipient, FOLDER_CALENDAR)
+    except pywintypes.com_error as exc:
+        raise ValueError(
+            f"Kein Zugriff auf den Kalender von '{mailbox}'. "
+            "Fehlt die Freigabe (mindestens Leserechte)?"
+        ) from exc
+
+
+def _collect_folders(root, item_type: int, max_depth: int) -> list:
+    result = []
+
+    def walk(folder, depth):
+        try:
+            if _safe(folder, "DefaultItemType") == item_type:
+                result.append(folder)
+            if depth < max_depth:
+                for sub in folder.Folders:
+                    walk(sub, depth + 1)
+        except pywintypes.com_error:
+            pass  # z. B. Ordner ohne Leserechte
+
+    walk(root, 0)
+    return result
+
+
+def _smtp_of_sender(item) -> str:
+    address = _safe(item, "SenderEmailAddress", "") or ""
+    if _safe(item, "SenderEmailType", "") == "EX":
+        try:
+            address = item.PropertyAccessor.GetProperty(PR_SENDER_SMTP) or address
+        except Exception:
+            pass
+    return address
+
+
+def _attachment_count(item) -> int:
+    try:
+        return int(item.Attachments.Count)
+    except Exception:
+        return 0
+
+
+def _open_item(entry_id: str, store_id: str):
+    ns = _namespace()
+    return (ns.GetItemFromID(entry_id, store_id) if store_id
+            else ns.GetItemFromID(entry_id))
+
+
+def _attachment_name(att) -> str:
+    return _safe(att, "FileName", "") or _safe(att, "DisplayName", "")
+
+
+def _attachment_info(att, nr: int, html_body: str) -> dict:
+    info = {
+        "nr": nr,
+        "name": _attachment_name(att),
+        "groesse_bytes": _safe(att, "Size"),
+        "typ": ATTACHMENT_TYPE.get(_safe(att, "Type"), ""),
+    }
+    content_id = ""
+    try:
+        content_id = att.PropertyAccessor.GetProperty(PR_ATTACH_CONTENT_ID) or ""
+    except Exception:
+        pass
+    if content_id and f"cid:{content_id}" in html_body:
+        info["im_text_eingebettet"] = True  # z. B. Logo in der Signatur
+    return info
+
+
+def _attachment_list(item) -> list[dict]:
+    html_body = _safe(item, "HTMLBody", "") or ""
+    result = []
+    try:
+        attachments = item.Attachments
+        for nr in range(1, int(attachments.Count) + 1):
+            result.append(_attachment_info(attachments.Item(nr), nr, html_body))
+    except Exception:
+        pass
+    return result
+
+
+# ============================================================
+# E-Mail
+# ============================================================
+
+def _mail_summary(item, folder) -> dict:
+    return {
+        "entry_id": _safe(item, "EntryID", ""),
+        "store_id": _safe(folder, "StoreID", ""),
+        "betreff": _safe(item, "Subject", ""),
+        "von": _safe(item, "SenderName", ""),
+        "von_email": _smtp_of_sender(item),
+        "empfangen": _fmt(_dt(_safe(item, "ReceivedTime"))),
+        "ungelesen": bool(_safe(item, "UnRead", False)),
+        "anhaenge": _attachment_count(item),
+        "ordner": _folder_path(folder),
+        "vorschau": _truncate(_safe(item, "Body", ""), PREVIEW_CHARS),
+    }
+
+
+def _list_folders_impl(max_depth: int) -> dict:
+    ns = _namespace()
+    folders = []
+    for store_root in ns.Folders:
+        for folder in _collect_folders(store_root, ITEM_TYPE_MAIL, max_depth):
+            folders.append({
+                "pfad": _folder_path(folder),
+                "name": _safe(folder, "Name", ""),
+                "elemente": _safe(_safe(folder, "Items"), "Count"),
+                "ungelesen": _safe(folder, "UnReadItemCount"),
+            })
+    return {"anzahl": len(folders), "ordner": folders}
+
+
+def _search_mails_impl(query, folder, include_subfolders, sender, date_from,
+                       date_to, unread_only, has_attachments, search_body,
+                       limit) -> dict:
+    limit = _limit(limit)
+    dt_from = _parse_date(date_from, "date_from")
+    dt_to = _parse_date(date_to, "date_to")
+    if dt_to and not _has_time(date_to):
+        dt_to += timedelta(days=1)  # Enddatum inklusive
+
+    root = _resolve_folder(folder, FOLDER_INBOX)
+    folders = (_collect_folders(root, ITEM_TYPE_MAIL, 10)
+               if include_subfolders else [root])
+
+    conditions = []
+    if query and query.strip():
+        q = _dasl_text(query.strip())
+        parts = [f"\"urn:schemas:httpmail:subject\" LIKE '%{q}%'"]
+        if search_body:
+            parts.append(f"\"urn:schemas:httpmail:textdescription\" LIKE '%{q}%'")
+        conditions.append("(" + " OR ".join(parts) + ")")
+    if sender and sender.strip():
+        s = _dasl_text(sender.strip())
+        conditions.append(
+            f"(\"urn:schemas:httpmail:fromname\" LIKE '%{s}%' OR "
+            f"\"urn:schemas:httpmail:fromemail\" LIKE '%{s}%')"
+        )
+    if unread_only:
+        conditions.append("\"urn:schemas:httpmail:read\" = 0")
+    if has_attachments:
+        conditions.append("\"urn:schemas:httpmail:hasattachment\" = 1")
+    dasl = "@SQL=" + " AND ".join(conditions) if conditions else None
+
+    hits: list[dict] = []
+    scanned = 0
+    truncated = False
+    for current in folders:
+        try:
+            items = current.Items
+            if dasl:
+                items = items.Restrict(dasl)
+            items.Sort("[ReceivedTime]", True)  # neueste zuerst
+        except pywintypes.com_error as exc:
+            log.warning("Ordner übersprungen (%s): %s", _folder_path(current), exc)
+            continue
+
+        found_here = 0
+        item = items.GetFirst()
+        while item is not None:
+            if scanned >= MAX_SCAN:
+                truncated = True
+                break
+            scanned += 1
+            received = _dt(_safe(item, "ReceivedTime"))
+            if received and dt_from and received < dt_from:
+                break  # sortiert: ältere folgen nur noch
+            if not (received and dt_to and received >= dt_to):
+                hits.append(_mail_summary(item, current))
+                found_here += 1
+                if found_here >= limit:
+                    break
+            item = items.GetNext()
+        if truncated:
+            break
+
+    hits.sort(key=lambda h: h["empfangen"] or "", reverse=True)
+    result = {"anzahl": min(len(hits), limit), "mails": hits[:limit]}
+    if truncated or len(hits) > limit:
+        result["hinweis"] = ("Weitere Treffer möglich. Suche eingrenzen "
+                             "(Zeitraum, Ordner, Absender).")
+    return result
+
+
+def _get_mail_impl(entry_id, store_id, max_body_chars) -> dict:
+    item = _open_item(entry_id, store_id)
+    attachments = _attachment_list(item)
+    limit = max(500, min(int(max_body_chars or MAX_BODY_CHARS), MAX_BODY_CHARS))
+    return {
+        "entry_id": _safe(item, "EntryID", ""),
+        "betreff": _safe(item, "Subject", ""),
+        "von": _safe(item, "SenderName", ""),
+        "von_email": _smtp_of_sender(item),
+        "an": _safe(item, "To", ""),
+        "cc": _safe(item, "CC", ""),
+        "empfangen": _fmt(_dt(_safe(item, "ReceivedTime"))),
+        "gesendet": _fmt(_dt(_safe(item, "SentOn"))),
+        "wichtigkeit": IMPORTANCE.get(_safe(item, "Importance"), "normal"),
+        "kategorien": _safe(item, "Categories", ""),
+        "konversation": _safe(item, "ConversationTopic", ""),
+        "ordner": _folder_path(_safe(item, "Parent")),
+        "anhaenge": attachments,
+        "text": _truncate(_safe(item, "Body", ""), limit),
+    }
+
+
+# ============================================================
+# Kalender
+# ============================================================
+
+def _calendar_filter_date(dt: datetime) -> str:
+    if CALENDAR_DATE_FORMAT:
+        return dt.strftime(CALENDAR_DATE_FORMAT)
+    # Kurzes Datumsformat von Windows, so wie es Outlook erwartet.
+    return dt.strftime("%x %H:%M")
+
+
+def _event_summary(item, folder) -> dict:
+    return {
+        "entry_id": _safe(item, "EntryID", ""),
+        "store_id": _safe(folder, "StoreID", ""),
+        "betreff": _safe(item, "Subject", ""),
+        "start": _fmt(_dt(_safe(item, "Start"))),
+        "ende": _fmt(_dt(_safe(item, "End"))),
+        "ganztaegig": bool(_safe(item, "AllDayEvent", False)),
+        "ort": _safe(item, "Location", ""),
+        "organisator": _safe(item, "Organizer", ""),
+        "serie": bool(_safe(item, "IsRecurring", False)),
+        "anzeigen_als": BUSY_STATUS.get(_safe(item, "BusyStatus"), ""),
+        "art": MEETING_STATUS.get(_safe(item, "MeetingStatus"), ""),
+        "meine_antwort": RESPONSE_STATUS.get(_safe(item, "ResponseStatus"), ""),
+        "kategorien": _safe(item, "Categories", ""),
+    }
+
+
+def _list_calendars_impl() -> dict:
+    ns = _namespace()
+    default = ns.GetDefaultFolder(FOLDER_CALENDAR)
+    default_id = _safe(default, "EntryID", "")
+    calendars = []
+    for store_root in ns.Folders:
+        for folder in _collect_folders(store_root, ITEM_TYPE_APPOINTMENT, 6):
+            calendars.append({
+                "pfad": _folder_path(folder),
+                "name": _safe(folder, "Name", ""),
+                "standard": _safe(folder, "EntryID", "") == default_id,
+            })
+    return {
+        "anzahl": len(calendars),
+        "kalender": calendars,
+        "hinweis": ("Kalender von Kolleginnen und Kollegen können über den "
+                    "Parameter 'shared_mailbox' von list_events abgefragt "
+                    "werden, sofern eine Freigabe besteht."),
+    }
+
+
+def _list_events_impl(start_date, end_date, calendar, shared_mailbox, query,
+                      limit) -> dict:
+    limit = _limit(limit)
+    start = _parse_date(start_date, "start_date")
+    if start is None:
+        start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    end = _parse_date(end_date, "end_date")
+    if end is None:
+        end = start + timedelta(days=7)
+    elif not _has_time(end_date):
+        end += timedelta(days=1)  # Enddatum inklusive
+    if end <= start:
+        raise ValueError("end_date muss nach start_date liegen.")
+    if (end - start).days > MAX_CALENDAR_DAYS:
+        raise ValueError(f"Zeitraum zu gross (max. {MAX_CALENDAR_DAYS} Tage).")
+
+    folder = (_shared_calendar(shared_mailbox) if shared_mailbox and shared_mailbox.strip()
+              else _resolve_folder(calendar, FOLDER_CALENDAR))
+
+    # Reihenfolge ist wichtig: Sort -> IncludeRecurrences -> Restrict,
+    # sonst werden Serientermine nicht korrekt aufgelöst.
+    items = folder.Items
+    items.Sort("[Start]")
+    items.IncludeRecurrences = True
+    flt = (f"[Start] < '{_calendar_filter_date(end)}' AND "
+           f"[End] > '{_calendar_filter_date(start)}'")
+    restricted = items.Restrict(flt)
+
+    needle = (query or "").strip().lower()
+    events = []
+    scanned = 0
+    item = restricted.GetFirst()
+    while item is not None and len(events) < limit and scanned < MAX_SCAN:
+        scanned += 1
+        s = _dt(_safe(item, "Start"))
+        e = _dt(_safe(item, "End"))
+        if s and s >= end:
+            break  # nach Start sortiert: keine weiteren Treffer
+        # Zusätzliche Prüfung in Python, unabhängig vom Datumsformat.
+        if s and e and s < end and e > start:
+            summary = _event_summary(item, folder)
+            haystack = " ".join(str(summary.get(k) or "") for k in
+                                ("betreff", "ort", "organisator", "kategorien")).lower()
+            if not needle or needle in haystack:
+                events.append(summary)
+        item = restricted.GetNext()
+
+    result = {
+        "kalender": _folder_path(folder),
+        "zeitraum": {"von": _fmt(start), "bis": _fmt(end)},
+        "anzahl": len(events),
+        "termine": events,
+    }
+    if len(events) >= limit:
+        result["hinweis"] = "Limit erreicht, Zeitraum eingrenzen für weitere Termine."
+    return result
+
+
+def _get_event_impl(entry_id, store_id, max_body_chars) -> dict:
+    item = _open_item(entry_id, store_id)
+    folder = _safe(item, "Parent")
+    data = _event_summary(item, folder)
+
+    attendees = []
+    try:
+        for recipient in item.Recipients:
+            email = ""
+            try:
+                email = recipient.PropertyAccessor.GetProperty(PR_SMTP_ADDRESS)
+            except Exception:
+                email = _safe(recipient, "Address", "")
+            attendees.append({
+                "name": _safe(recipient, "Name", ""),
+                "email": email,
+                "typ": RECIPIENT_TYPE.get(_safe(recipient, "Type"), ""),
+                "antwort": RESPONSE_STATUS.get(_safe(recipient, "MeetingResponseStatus"), ""),
+            })
+    except Exception:
+        pass
+
+    if data["serie"]:
+        try:
+            pattern = item.GetRecurrencePattern()
+            data["serienmuster"] = {
+                "beginn": _fmt(_dt(_safe(pattern, "PatternStartDate"))),
+                "ende": _fmt(_dt(_safe(pattern, "PatternEndDate"))),
+                "ohne_ende": bool(_safe(pattern, "NoEndDate", False)),
+            }
+        except Exception:
+            pass
+
+    limit = max(500, min(int(max_body_chars or MAX_BODY_CHARS), MAX_BODY_CHARS))
+    data.update({
+        "erforderliche_teilnehmende": _safe(item, "RequiredAttendees", ""),
+        "optionale_teilnehmende": _safe(item, "OptionalAttendees", ""),
+        "teilnehmende": attendees,
+        "kalender": _folder_path(folder),
+        "anhaenge": _attachment_list(item),
+        "text": _truncate(_safe(item, "Body", ""), limit),
+    })
+    return data
+
+
+# ============================================================
+# Anhänge
+# Der Anhang wird in ein eigenes temporäres Verzeichnis unter
+# festem Namen gespeichert (kein Pfad aus dem Dateinamen), der
+# Inhalt gelesen und das Verzeichnis danach wieder gelöscht.
+# ============================================================
+
+TEXT_EXTENSIONS = {".txt", ".csv", ".tsv", ".log", ".json", ".xml", ".md",
+                   ".ics", ".vcf", ".ini", ".cfg", ".yaml", ".yml", ".sql",
+                   ".ps1", ".py", ".js", ".css", ".rtf"}
+HTML_EXTENSIONS = {".html", ".htm"}
+IMAGE_FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg",
+                 ".gif": "gif", ".webp": "webp"}
+SUPPORTED_HINT = ("Unterstützt: PDF, DOCX, XLSX, PPTX, MSG, EML, ZIP "
+                  "(Inhaltsverzeichnis), HTML, Textdateien, Bilder (PNG, JPG, GIF, WEBP).")
+
+W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+MAX_ZIP_MEMBER_BYTES = 50_000_000
+
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _decode(data: bytes) -> str:
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1")
+
+
+def _html_to_text(markup: str) -> str:
+    markup = re.sub(r"(?is)<(script|style|head)\b.*?</\1\s*>", " ", markup)
+    markup = re.sub(r"(?i)<br\s*/?>|</(p|div|tr|li|h[1-6]|table)\s*>", "\n", markup)
+    markup = re.sub(r"(?i)</t[dh]\s*>", "\t", markup)
+    markup = re.sub(r"<[^>]+>", "", markup)
+    text = html.unescape(markup).replace("\xa0", " ")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return re.sub(r"\n\s*\n+", "\n\n", text).strip()
+
+
+def _pdf_text(path: str, limit: int) -> tuple[str, str | None]:
+    from pypdf import PdfReader
+
+    reader = PdfReader(path)
+    if reader.is_encrypted:
+        try:
+            if not reader.decrypt(""):
+                raise ValueError
+        except Exception:
+            raise ValueError("Das PDF ist passwortgeschützt und kann nicht gelesen werden.")
+    parts, total = [], 0
+    page_count = len(reader.pages)
+    for nr, page in enumerate(reader.pages, 1):
+        text = (page.extract_text() or "").strip()
+        if text:
+            parts.append(f"--- Seite {nr} ---\n{text}")
+            total += len(text)
+        if total > limit:
+            break
+    if not parts:
+        return "", (f"{page_count} Seiten, aber kein Text gefunden "
+                    "(vermutlich ein gescanntes PDF ohne Texterkennung).")
+    return "\n\n".join(parts), f"{page_count} Seiten"
+
+
+def _xlsx_text(path: str, limit: int) -> tuple[str, str | None]:
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        parts, total = [], 0
+        sheets = workbook.worksheets
+        for sheet in sheets:
+            lines = [f"--- Blatt: {sheet.title} ---"]
+            for row in sheet.iter_rows(values_only=True):
+                cells = ["" if v is None else str(v) for v in row]
+                while cells and not cells[-1]:
+                    cells.pop()
+                if not cells:
+                    continue
+                line = "\t".join(cells)
+                lines.append(line)
+                total += len(line) + 1
+                if total > limit:
+                    break
+            parts.append("\n".join(lines))
+            if total > limit:
+                break
+        return "\n\n".join(parts), f"{len(sheets)} Blätter, Zellen tabulatorgetrennt"
+    finally:
+        workbook.close()
+
+
+def _zip_member(archive: zipfile.ZipFile, name: str) -> bytes:
+    if archive.getinfo(name).file_size > MAX_ZIP_MEMBER_BYTES:
+        raise ValueError("Dokument zu gross zum Lesen.")
+    return archive.read(name)
+
+
+def _ooxml_paragraphs(xml_data: bytes, ns: str) -> list[str]:
+    root = ET.fromstring(xml_data)
+    lines = []
+    for paragraph in root.iter(ns + "p"):
+        chunks = []
+        for node in paragraph.iter():
+            if node.tag == ns + "t":
+                chunks.append(node.text or "")
+            elif node.tag == ns + "tab":
+                chunks.append("\t")
+            elif node.tag in (ns + "br", ns + "cr"):
+                chunks.append("\n")
+        line = "".join(chunks).strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _docx_text(path: str) -> str:
+    with zipfile.ZipFile(path) as archive:
+        return "\n".join(_ooxml_paragraphs(
+            _zip_member(archive, "word/document.xml"), W_NS))
+
+
+def _pptx_text(path: str) -> tuple[str, str | None]:
+    with zipfile.ZipFile(path) as archive:
+        slides = sorted(
+            (n for n in archive.namelist()
+             if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+            key=lambda n: int(re.search(r"(\d+)\.xml$", n).group(1)),
+        )
+        parts = []
+        for nr, name in enumerate(slides, 1):
+            lines = _ooxml_paragraphs(_zip_member(archive, name), A_NS)
+            parts.append(f"--- Folie {nr} ---\n" + "\n".join(lines))
+    return "\n\n".join(parts), f"{len(slides)} Folien"
+
+
+def _zip_listing(path: str) -> str:
+    with zipfile.ZipFile(path) as archive:
+        lines = [f"{info.filename} ({info.file_size} Bytes)"
+                 for info in archive.infolist() if not info.is_dir()]
+    return "Inhalt des ZIP-Archivs:\n" + "\n".join(lines)
+
+
+def _eml_text(path: str) -> str:
+    message = email.message_from_bytes(_read_bytes(path), policy=policy.default)
+    lines = [
+        f"Betreff: {message['subject'] or ''}",
+        f"Von: {message['from'] or ''}",
+        f"An: {message['to'] or ''}",
+        f"Cc: {message['cc'] or ''}",
+        f"Datum: {message['date'] or ''}",
+    ]
+    names = [p.get_filename() for p in message.iter_attachments() if p.get_filename()]
+    if names:
+        lines.append("Anhänge: " + ", ".join(names))
+    body = message.get_body(preferencelist=("plain", "html"))
+    text = ""
+    if body is not None:
+        text = body.get_content()
+        if body.get_content_type() == "text/html":
+            text = _html_to_text(text)
+    return "\n".join(lines) + "\n\n" + text
+
+
+def _msg_text(path: str) -> str:
+    item = _namespace().OpenSharedItem(path)
+    try:
+        lines = [
+            f"Betreff: {_safe(item, 'Subject', '')}",
+            f"Von: {_safe(item, 'SenderName', '')} <{_smtp_of_sender(item)}>",
+            f"An: {_safe(item, 'To', '')}",
+            f"Cc: {_safe(item, 'CC', '')}",
+            f"Gesendet: {_fmt(_dt(_safe(item, 'SentOn'))) or ''}",
+        ]
+        names = [a["name"] for a in _attachment_list(item)]
+        if names:
+            lines.append("Anhänge: " + ", ".join(names) +
+                         " (nicht direkt lesbar, da in der angehängten Mail)")
+        return "\n".join(lines) + "\n\n" + (_safe(item, "Body", "") or "")
+    finally:
+        try:
+            item.Close(1)  # olDiscard: nichts speichern, Datei freigeben
+        except Exception:
+            pass
+        del item
+
+
+def _image_content(path: str, ext: str, info: dict) -> Image | None:
+    """Bild unverändert übergeben, wenn es klein genug ist, sonst
+    verkleinern. Claude skaliert grosse Bilder ohnehin herunter."""
+    from PIL import Image as PILImage
+
+    data = _read_bytes(path)
+    with PILImage.open(path) as img:
+        width, height = img.size
+        info["abmessungen"] = f"{width}x{height}"
+        if len(data) <= MAX_IMAGE_BYTES and max(width, height) <= MAX_IMAGE_EDGE:
+            return Image(data=data, format=IMAGE_FORMATS[ext])
+
+        img.seek(0)  # bei animierten Bildern das erste Bild
+        img = img.copy()
+        img.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE))
+        transparent = img.mode in ("RGBA", "LA", "P") and (
+            img.mode != "P" or "transparency" in img.info)
+
+    if transparent:
+        buffer = io.BytesIO()
+        img.convert("RGBA").save(buffer, format="PNG", optimize=True)
+        if buffer.tell() <= MAX_IMAGE_BYTES:
+            info["hinweis"] = f"Bild verkleinert auf {img.width}x{img.height}."
+            return Image(data=buffer.getvalue(), format="png")
+    rgb = img.convert("RGBA").convert("RGB") if transparent else img.convert("RGB")
+    for quality in (85, 70, 50):
+        buffer = io.BytesIO()
+        rgb.save(buffer, format="JPEG", quality=quality, optimize=True)
+        if buffer.tell() <= MAX_IMAGE_BYTES:
+            info["hinweis"] = f"Bild verkleinert auf {img.width}x{img.height} (JPEG)."
+            return Image(data=buffer.getvalue(), format="jpeg")
+    return None
+
+
+def _extract_attachment(path: str, ext: str, offset: int, limit: int, info: dict):
+    if ext in IMAGE_FORMATS:
+        try:
+            image = _image_content(path, ext, info)
+        except Exception as exc:
+            info["hinweis"] = f"Bild konnte nicht gelesen werden: {exc}"
+            return info
+        if image is None:
+            info["hinweis"] = "Bild ist auch verkleinert zu gross für die Übertragung."
+            return info
+        info["inhalt"] = "Bild, siehe nachfolgende Bilddaten."
+        return [info, image]
+
+    # Formate mit vielen Seiten werden nur so weit gelesen wie nötig.
+    need = offset + limit + 1
+    note = None
+    if ext == ".pdf":
+        text, note = _pdf_text(path, need)
+    elif ext in (".xlsx", ".xlsm"):
+        text, note = _xlsx_text(path, need)
+    elif ext in (".docx", ".docm"):
+        text = _docx_text(path)
+    elif ext in (".pptx", ".pptm"):
+        text, note = _pptx_text(path)
+    elif ext == ".msg":
+        text = _msg_text(path)
+    elif ext == ".eml":
+        text = _eml_text(path)
+    elif ext == ".zip":
+        text = _zip_listing(path)
+    elif ext in HTML_EXTENSIONS:
+        text = _html_to_text(_decode(_read_bytes(path)))
+    elif ext in TEXT_EXTENSIONS:
+        text = _decode(_read_bytes(path))
+    else:
+        info["hinweis"] = (f"Format '{ext or 'ohne Endung'}' wird nicht "
+                           f"unterstützt. {SUPPORTED_HINT}")
+        return info
+
+    text = (text or "").replace("\r\n", "\n").strip()
+    if offset and offset >= len(text):
+        raise ValueError(f"offset {offset} liegt hinter dem Textende "
+                         f"({len(text)} Zeichen).")
+    end = offset + limit
+    info["text"] = text[offset:end]
+    info["von_zeichen"] = offset
+    if len(text) > end:
+        info["naechster_offset"] = end
+        info["fortsetzung"] = (f"Text geht weiter. Für den nächsten Teil "
+                               f"get_attachment mit offset={end} aufrufen.")
+    if note:
+        info["hinweis"] = note
+    return info
+
+
+def _get_attachment_impl(entry_id, store_id, index, name, offset, max_chars):
+    item = _open_item(entry_id, store_id)
+    attachments = item.Attachments
+    count = int(attachments.Count)
+    if count == 0:
+        raise ValueError("Das Element hat keine Anhänge.")
+
+    if index:
+        if not 1 <= index <= count:
+            raise ValueError(f"Ungültige Anhangnummer {index} (vorhanden: 1 bis {count}).")
+        att = attachments.Item(index)
+    elif name and name.strip():
+        wanted = name.strip().lower()
+        att = None
+        for nr in range(1, count + 1):
+            candidate = attachments.Item(nr)
+            if _attachment_name(candidate).lower() == wanted:
+                att, index = candidate, nr
+                break
+        if att is None:
+            raise ValueError(f"Anhang '{name}' nicht gefunden. "
+                             "Die Liste der Anhänge liefert get_mail bzw. get_event.")
+    elif count == 1:
+        att, index = attachments.Item(1), 1
+    else:
+        raise ValueError(f"Das Element hat {count} Anhänge: bitte 'index' oder "
+                         "'name' angeben (Liste über get_mail bzw. get_event).")
+
+    info = _attachment_info(att, index, _safe(item, "HTMLBody", "") or "")
+    att_type = _safe(att, "Type")
+    if att_type == ATT_BY_REFERENCE:
+        info["hinweis"] = "Verknüpfung auf eine externe Datei, Inhalt ist nicht in der Mail gespeichert."
+        return info
+    size = _safe(att, "Size", 0) or 0
+    if size > MAX_ATTACHMENT_BYTES:
+        info["hinweis"] = f"Anhang zu gross ({size} Bytes, max. {MAX_ATTACHMENT_BYTES})."
+        return info
+
+    ext = ".msg" if att_type == ATT_EMBEDDED else os.path.splitext(info["name"])[1].lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,10}", ext):
+        ext = ""
+    limit = max(500, min(int(max_chars or MAX_ATTACHMENT_CHARS), MAX_ATTACHMENT_CHARS))
+    offset = max(0, int(offset or 0))
+
+    tmpdir = tempfile.mkdtemp(prefix="outlook-mcp-")
+    try:
+        path = os.path.join(tmpdir, "anhang" + ext)
+        att.SaveAsFile(path)
+        return _extract_attachment(path, ext, offset, limit, info)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ============================================================
+# MCP-Werkzeuge
+# ============================================================
+
+mcp = FastMCP(
+    "outlook",
+    instructions=(
+        "Lesender Zugriff auf E-Mails und Kalender im klassischen Outlook. "
+        "Erst mit search_mails bzw. list_events suchen, dann Details mit "
+        "get_mail bzw. get_event abrufen. Anhänge mit get_attachment lesen "
+        "(Nummer 'nr' aus get_mail). Datumsangaben im Format JJJJ-MM-TT."
+    ),
+)
+
+
+@mcp.tool()
+async def list_folders(max_depth: int = 3) -> dict:
+    """Listet die E-Mail-Ordner aller eingebundenen Postfächer mit Pfad,
+    Anzahl Elemente und Anzahl ungelesener Elemente auf.
+
+    max_depth: Wie tief Unterordner durchsucht werden (Standard 3).
+    """
+    return await _run(_list_folders_impl, max(0, min(max_depth, 10)))
+
+
+@mcp.tool()
+async def search_mails(
+    query: str = "",
+    folder: str = "",
+    include_subfolders: bool = False,
+    sender: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    unread_only: bool = False,
+    has_attachments: bool = False,
+    search_body: bool = True,
+    limit: int = 20,
+) -> dict:
+    """Durchsucht E-Mails, neueste zuerst. Liefert Kurzinfos mit entry_id
+    und store_id für get_mail.
+
+    query: Suchbegriff in Betreff und (bei search_body) im Text.
+    folder: Leer = Posteingang. Kurzname ('Posteingang', 'Gesendet',
+        'Entwürfe', 'Gelöscht') oder vollständiger Pfad aus list_folders.
+        Für das ganze Postfach den Stammpfad (z. B. '\\\\max@firma.ch')
+        mit include_subfolders=true angeben.
+    include_subfolders: Unterordner mit durchsuchen.
+    sender: Teil des Absendernamens oder der Absenderadresse.
+    date_from / date_to: Zeitraum (JJJJ-MM-TT), beide inklusive.
+    unread_only: Nur ungelesene Mails.
+    has_attachments: Nur Mails mit Anhang.
+    search_body: Auch im Nachrichtentext suchen (langsamer).
+    limit: Maximale Anzahl Treffer.
+    """
+    return await _run(_search_mails_impl, query, folder, include_subfolders,
+                      sender, date_from, date_to, unread_only,
+                      has_attachments, search_body, limit)
+
+
+@mcp.tool()
+async def get_mail(entry_id: str, store_id: str = "",
+                   max_body_chars: int = MAX_BODY_CHARS) -> dict:
+    """Liest eine einzelne E-Mail vollständig (Kopfdaten, Text, Liste der
+    Anhänge mit Nummer 'nr'). Die Mail wird dabei nicht als gelesen
+    markiert. Den Inhalt eines Anhangs liefert get_attachment.
+
+    entry_id / store_id: Werte aus search_mails.
+    max_body_chars: Maximale Textlänge.
+    """
+    return await _run(_get_mail_impl, entry_id, store_id, max_body_chars)
+
+
+@mcp.tool()
+async def get_attachment(entry_id: str, store_id: str = "", index: int = 0,
+                         name: str = "", offset: int = 0,
+                         max_chars: int = MAX_ATTACHMENT_CHARS):
+    """Liest den Inhalt eines Anhangs einer E-Mail oder eines Termins.
+    Text wird aus PDF, DOCX, XLSX, PPTX, angehängten Mails (MSG, EML),
+    HTML- und Textdateien extrahiert, bei ZIP wird das Inhaltsverzeichnis
+    geliefert. Bilder (PNG, JPG, GIF, WEBP) werden als Bild übergeben,
+    grosse Bilder vorher verkleinert. Die Mail wird dabei nicht verändert.
+
+    Lange Texte werden in Teilen geliefert: Enthält die Antwort
+    'naechster_offset', mit diesem Wert als offset erneut aufrufen.
+
+    entry_id / store_id: Werte aus search_mails bzw. list_events.
+    index: Nummer 'nr' des Anhangs aus get_mail bzw. get_event.
+    name: Alternativ der Dateiname des Anhangs. Bei nur einem Anhang
+        können index und name weggelassen werden.
+    offset: Startposition im Text (Zeichen), Standard 0.
+    max_chars: Maximale Textlänge pro Aufruf.
+    """
+    return await _run(_get_attachment_impl, entry_id, store_id, index,
+                      name, offset, max_chars)
+
+
+@mcp.tool()
+async def list_calendars() -> dict:
+    """Listet alle Kalenderordner der eingebundenen Postfächer auf."""
+    return await _run(_list_calendars_impl)
+
+
+@mcp.tool()
+async def list_events(
+    start_date: str = "",
+    end_date: str = "",
+    calendar: str = "",
+    shared_mailbox: str = "",
+    query: str = "",
+    limit: int = 50,
+) -> dict:
+    """Listet Kalendertermine in einem Zeitraum auf, chronologisch.
+    Serientermine werden in einzelne Vorkommen aufgelöst.
+
+    start_date: Beginn (JJJJ-MM-TT), Standard heute.
+    end_date: Ende inklusive (JJJJ-MM-TT), Standard start_date + 7 Tage.
+    calendar: Leer = eigener Standardkalender, sonst Pfad aus list_calendars.
+    shared_mailbox: E-Mail-Adresse einer Person oder eines Raums, deren
+        freigegebener Standardkalender gelesen werden soll.
+    query: Filter auf Betreff, Ort, Organisator und Kategorien.
+    limit: Maximale Anzahl Termine.
+    """
+    return await _run(_list_events_impl, start_date, end_date, calendar,
+                      shared_mailbox, query, limit)
+
+
+@mcp.tool()
+async def get_event(entry_id: str, store_id: str = "",
+                    max_body_chars: int = MAX_BODY_CHARS) -> dict:
+    """Liest einen Termin mit Teilnehmenden, Antworten und Beschreibung
+    (z. B. Teams-Link). Bei Serienterminen wird der Serienmaster mit
+    Serienmuster geliefert.
+
+    entry_id / store_id: Werte aus list_events.
+    max_body_chars: Maximale Textlänge der Beschreibung.
+    """
+    return await _run(_get_event_impl, entry_id, store_id, max_body_chars)
+
+
+def main() -> None:
+    try:
+        locale.setlocale(locale.LC_TIME, "")
+    except locale.Error:
+        log.warning("Systemgebietsschema konnte nicht gesetzt werden")
+    log.info("Outlook MCP Server startet (nur lesend)")
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()
