@@ -1,0 +1,30 @@
+[project]
+name = "mcp-outlook-com"
+version = "1.0.0"
+description = "MCP-Server für Claude Desktop: E-Mails und Kalender im klassischen Outlook über COM"
+readme = "README.md"
+requires-python = ">=3.12"
+# mcp wird auf 1.x begrenzt, da Version 2 die API ändern kann.
+# pypdf und openpyxl lesen Text aus PDF- bzw. Excel-Anhängen,
+# pillow verkleinert grosse Bilder.
+dependencies = [
+  "mcp>=1.10,<2",
+  "pywin32",
+  "pypdf",
+  "openpyxl",
+  "pillow",
+]
+
+[project.urls]
+Repository = "https://github.com/StefanZHAW/mcp-outlook-com"
+Releases = "https://github.com/StefanZHAW/mcp-outlook-com/releases"
+
+[project.scripts]
+mcp-outlook-com = "mcp_outlook_com.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp_outlook_com"]

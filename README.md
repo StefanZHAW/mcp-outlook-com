@@ -6,9 +6,17 @@ Schreibend werden nur Entwürfe angelegt (neue Mail, Antwort, Weiterleitung); be
 
 ## Installation
 
-Installiert wird der Server mit dem Skript `Install-ClaudeMcp.ps1` aus [mcp-install-for-claude-desktop](https://gitlab.zhaw.ch/enterprise-applications/mcp-install-for-claude-desktop) (Komponente `outlook`). Das Skript holt mit Git den neuesten Stand von `main` aus diesem Repository, installiert die Abhängigkeiten aus `requirements.txt` und legt den Server unter `%USERPROFILE%\.mcp\outlook\outlook_mcp_server.py` ab.
+Installiert wird der Server mit dem Skript `Install-ClaudeMcp.ps1` aus [mcp-install-for-claude-desktop](https://gitlab.zhaw.ch/enterprise-applications/mcp-install-for-claude-desktop) (Komponente `outlook`). Das Skript lädt das Paket (Wheel) eines [Releases](https://github.com/StefanZHAW/mcp-outlook-com/releases) in der dort fest eingetragenen Version herunter, prüft die Prüfsumme (SHA256) und installiert es mit seinen Abhängigkeiten in `%USERPROFILE%\.mcp\outlook\.venv`. Git wird dafür nicht benötigt.
 
-**Jeder Push auf `main` gelangt bei der nächsten Ausführung des Installationsskripts auf alle Rechner.** Änderungen deshalb vorher testen.
+Ein Push auf `main` ändert an installierten Rechnern nichts. Neue Stände kommen erst mit einem Release und der angepassten Version im Installationsskript dorthin.
+
+Von Hand, z. B. zum Testen:
+
+```powershell
+pip install https://github.com/StefanZHAW/mcp-outlook-com/releases/download/v<Version>/mcp_outlook_com-<Version>-py3-none-any.whl
+```
+
+Gestartet wird der Server mit `mcp-outlook-com.exe` aus der virtuellen Umgebung oder mit `python -m mcp_outlook_com`.
 
 ## Werkzeuge
 
@@ -83,7 +91,7 @@ Beispiel und Hinweise zum Eintragen: siehe README von [mcp-install-for-claude-de
 ## Voraussetzungen
 
 - Windows mit dem **klassischen** Outlook (das neue Outlook bietet keinen COM-Zugriff)
-- Python 3.12 mit den Paketen aus `requirements.txt`
+- Python 3.12 (die Abhängigkeiten installiert das Paket mit)
 - Ausführung als normaler Benutzer, nicht mit Administratorrechten
 
 ## Entwicklung
@@ -92,8 +100,23 @@ Lokal testen, ohne Claude Desktop:
 
 ```powershell
 uv venv --python 3.12
-uv pip install -r requirements.txt
-.venv\Scripts\python.exe -m py_compile outlook_mcp_server.py
+uv pip install -e .
+.venv\Scripts\python.exe -c "import mcp_outlook_com.server"
 ```
 
-Abhängigkeiten nur in `requirements.txt` ändern; das Installationsskript übernimmt sie von dort. `mcp` bleibt auf 1.x begrenzt, da Version 2 die API ändern kann.
+Der Code liegt in `mcp_outlook_com/server.py`. Abhängigkeiten stehen in `pyproject.toml` (`dependencies`); das Paket bringt sie bei der Installation mit. `mcp` bleibt auf 1.x begrenzt, da Version 2 die API ändern kann.
+
+Bei jedem Push auf `main` und jedem Pull-Request baut der Workflow `CI` das Wheel und prüft unter Windows, dass es sich installieren und importieren lässt.
+
+## Releases
+
+1. Version in `pyproject.toml` erhöhen (z. B. `1.0.0` → `1.1.0`), committen und auf `main` pushen.
+2. Tag setzen und pushen:
+
+   ```powershell
+   git tag v1.1.0
+   git push origin v1.1.0
+   ```
+
+3. Der Workflow `Release` prüft, dass Tag und Version übereinstimmen, baut das Wheel und erstellt den [Release](https://github.com/StefanZHAW/mcp-outlook-com/releases) mit dem Wheel, der Prüfsumme (SHA256) und automatisch erzeugten Release Notes. Die Release Notes lassen sich danach auf GitHub ergänzen.
+4. In `Install-ClaudeMcp.ps1` (mcp-install-for-claude-desktop) `$OutlookVersion` und `$OutlookWheelSha256` auf die Werte aus dem Release setzen. Erst damit kommt die neue Version auf die Rechner.

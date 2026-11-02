@@ -1,0 +1,47 @@
+name: CI
+
+# Baut das Paket und prüft unter Windows, dass es sich installieren und
+# importieren lässt. Outlook selbst ist auf dem Runner nicht vorhanden.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build
+        shell: bash
+        run: |
+          pip install uv
+          uv build --wheel
+
+      - name: Install and import
+        shell: bash
+        run: |
+          uv venv --python 3.12 test-venv
+          uv pip install --python test-venv dist/*.whl
+          test-venv/Scripts/python.exe -c "import mcp_outlook_com, mcp_outlook_com.server as s; print('Import OK', mcp_outlook_com.__version__, s.mcp.name)"
+          test -f test-venv/Scripts/mcp-outlook-com.exe
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/*.whl
+          if-no-files-found: error

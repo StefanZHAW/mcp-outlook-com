@@ -1,0 +1,74 @@
+name: Release
+
+# Ein Tag v<Version> (z. B. v1.0.0) erstellt einen GitHub Release mit dem
+# Wheel und dessen Prüfsumme. Die Version im Tag muss mit pyproject.toml
+# übereinstimmen.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME passt nicht zur Version $version in pyproject.toml."
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: dist
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          wheel="dist/mcp_outlook_com-$VERSION-py3-none-any.whl"
+          test -f "$wheel"
+          sha256=$(sha256sum "$wheel" | cut -d' ' -f1 | tr 'a-f' 'A-F')
+          url="https://github.com/$GH_REPO/releases/download/$GITHUB_REF_NAME/$(basename "$wheel")"
+          cat > notes.md <<EOF
+          ## Installation
+
+          Mit \`Install-ClaudeMcp.ps1\` aus [mcp-install-for-claude-desktop](https://gitlab.zhaw.ch/enterprise-applications/mcp-install-for-claude-desktop) (Komponente \`outlook\`). Dort Version und Prüfsumme anpassen:
+
+          \`\`\`powershell
+          \$OutlookVersion      = "$VERSION"
+          \$OutlookWheelSha256  = "$sha256"
+          \`\`\`
+
+          Von Hand:
+
+          \`\`\`bash
+          pip install $url
+          \`\`\`
+
+          SHA256 des Wheels: \`$sha256\`
+
+          EOF
+          gh release create "$GITHUB_REF_NAME" "$wheel" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --generate-notes \
+            --verify-tag

@@ -44,6 +44,8 @@ import pywintypes
 import win32com.client
 from mcp.server.fastmcp import FastMCP, Image
 
+from . import __version__
+
 # Protokoll ausschliesslich auf stderr: stdout gehört dem MCP-Protokoll.
 logging.basicConfig(
     stream=sys.stderr,
@@ -1766,7 +1768,8 @@ def main() -> None:
         locale.setlocale(locale.LC_TIME, "")
     except locale.Error:
         log.warning("Systemgebietsschema konnte nicht gesetzt werden")
-    log.info("Outlook MCP Server startet (lesend, Entwürfe ohne Senden)")
+    log.info("Outlook MCP Server %s startet (lesend, Entwürfe ohne Senden)",
+             __version__)
     mcp.run()
 
 
