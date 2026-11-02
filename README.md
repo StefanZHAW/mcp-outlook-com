@@ -95,7 +95,9 @@ Beispiel für den Eintrag in `claude_desktop_config.json` (Pfad an die eigene In
     "outlook": {
       "command": "C:\\Users\\<Benutzer>\\.mcp\\outlook\\.venv\\Scripts\\mcp-outlook-com.exe",
       "env": {
-        "OUTLOOK_MCP_MAX_RESULTS": "50"
+        "PYTHONUTF8": "1",
+        "OUTLOOK_MCP_MAX_RESULTS": "50",
+        "OUTLOOK_MCP_MAX_BODY_CHARS": "20000"
       }
     }
   }
