@@ -13,6 +13,8 @@ py -3.12 -m venv "$env:USERPROFILE\.mcp\outlook\.venv"
 & "$env:USERPROFILE\.mcp\outlook\.venv\Scripts\python.exe" -m pip install https://github.com/StefanZHAW/mcp-outlook-com/releases/download/v<Version>/mcp_outlook_com-<Version>-py3-none-any.whl
 ```
 
+Alternativ startet [uv](https://docs.astral.sh/uv/) den Server mit `uvx` direkt aus dem Wheel, ohne eigene virtuelle Umgebung (Beispiel unter [Konfiguration](#konfiguration)). uv legt die Umgebung beim ersten Start selbst an und nimmt sie danach aus seinem Cache.
+
 Ein Push auf `main` ändert an installierten Rechnern nichts. Neue Stände kommen erst mit einem Release und einer erneuten Installation dorthin.
 
 Gestartet wird der Server mit `mcp-outlook-com.exe` aus der virtuellen Umgebung oder mit `python -m mcp_outlook_com`.
@@ -100,6 +102,23 @@ Beispiel für den Eintrag in `claude_desktop_config.json` (Pfad an die eigene In
 }
 ```
 
+Mit `uvx` statt eigener Installation (`uvx` muss im `PATH` liegen, sonst den vollständigen Pfad angeben; die Version steht in der Adresse des Wheels):
+
+```json
+{
+  "mcpServers": {
+    "outlook": {
+      "command": "uvx",
+      "args": [
+        "--python", "3.12",
+        "--from", "https://github.com/StefanZHAW/mcp-outlook-com/releases/download/v<Version>/mcp_outlook_com-<Version>-py3-none-any.whl",
+        "mcp-outlook-com"
+      ]
+    }
+  }
+}
+```
+
 Nach einer Änderung Claude Desktop vollständig beenden und neu starten.
 
 ## Voraussetzungen
@@ -133,3 +152,14 @@ Bei jedem Push auf `main` und jedem Pull-Request baut der Workflow `CI` das Whee
    ```
 
 3. Der Workflow `Release` prüft, dass Tag und Version übereinstimmen, baut das Wheel und erstellt den [Release](https://github.com/StefanZHAW/mcp-outlook-com/releases) mit dem Wheel, der Prüfsumme (SHA256) und automatisch erzeugten Release Notes. Die Release Notes lassen sich danach auf GitHub ergänzen.
+
+## Referenzen
+
+- [Model Context Protocol](https://modelcontextprotocol.io/)
+- [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
+- [Outlook-Objektmodell (VBA-Referenz)](https://learn.microsoft.com/office/vba/api/overview/outlook/object-model)
+- [pywin32](https://github.com/mhammond/pywin32)
+
+## Lizenz
+
+[MIT](LICENSE)
