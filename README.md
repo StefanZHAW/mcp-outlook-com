@@ -1,20 +1,19 @@
 # mcp-outlook-com
 
-MCP-Server des Teams Enterprise Applications für **Claude Desktop**: lesender Zugriff auf E-Mails, Kalender und Anhänge im **klassischen Outlook** über das COM-Objektmodell, dazu das Anlegen von E-Mail-Entwürfen und das Vorbereiten von Besprechungseinladungen.
+MCP-Server für **Claude Desktop**: lesender Zugriff auf E-Mails, Kalender und Anhänge im **klassischen Outlook** über das COM-Objektmodell, dazu das Anlegen von E-Mail-Entwürfen und das Vorbereiten von Besprechungseinladungen.
 
 Schreibend werden nur Entwürfe angelegt (neue Mail, Antwort, Weiterleitung); bestehende Entwürfe werden nicht geändert. Besprechungseinladungen werden vorbefüllt in einem Outlook-Fenster geöffnet, aber nicht gespeichert. Es wird nichts gesendet, verschoben oder gelöscht; dafür gibt es bewusst kein Werkzeug. Mails werden beim Lesen nicht als gelesen markiert. Anhänge werden zum Lesen kurz in ein temporäres Verzeichnis gespeichert und danach wieder gelöscht.
 
 ## Installation
 
-Installiert wird der Server mit dem Skript `Install-ClaudeMcp.ps1` aus [mcp-install-for-claude-desktop](https://gitlab.zhaw.ch/enterprise-applications/mcp-install-for-claude-desktop) (Komponente `outlook`). Das Skript lädt das Paket (Wheel) eines [Releases](https://github.com/StefanZHAW/mcp-outlook-com/releases) in der dort fest eingetragenen Version herunter, prüft die Prüfsumme (SHA256) und installiert es mit seinen Abhängigkeiten in `%USERPROFILE%\.mcp\outlook\.venv`. Git wird dafür nicht benötigt.
-
-Ein Push auf `main` ändert an installierten Rechnern nichts. Neue Stände kommen erst mit einem Release und der angepassten Version im Installationsskript dorthin.
-
-Von Hand, z. B. zum Testen:
+Installiert wird das Paket (Wheel) eines [Releases](https://github.com/StefanZHAW/mcp-outlook-com/releases) in eine eigene virtuelle Umgebung, z. B. `%USERPROFILE%\.mcp\outlook\.venv`. Die Abhängigkeiten kommen dabei mit, Git wird nicht benötigt. Die Prüfsumme (SHA256) des Wheels steht in den Release Notes.
 
 ```powershell
-pip install https://github.com/StefanZHAW/mcp-outlook-com/releases/download/v<Version>/mcp_outlook_com-<Version>-py3-none-any.whl
+py -3.12 -m venv "$env:USERPROFILE\.mcp\outlook\.venv"
+& "$env:USERPROFILE\.mcp\outlook\.venv\Scripts\python.exe" -m pip install https://github.com/StefanZHAW/mcp-outlook-com/releases/download/v<Version>/mcp_outlook_com-<Version>-py3-none-any.whl
 ```
+
+Ein Push auf `main` ändert an installierten Rechnern nichts. Neue Stände kommen erst mit einem Release und einer erneuten Installation dorthin.
 
 Gestartet wird der Server mit `mcp-outlook-com.exe` aus der virtuellen Umgebung oder mit `python -m mcp_outlook_com`.
 
@@ -86,7 +85,22 @@ Zu beachten:
 | `OUTLOOK_MCP_DRAFT_FONT_SIZE` | 12 | Schriftgrösse (pt) für den Text von Entwürfen |
 | `OUTLOOK_MCP_DATE_FORMAT` | leer | Datumsformat für Kalenderfilter, leer = kurzes Datumsformat von Windows. Bei Problemen z. B. `%d.%m.%Y %H:%M` |
 
-Beispiel und Hinweise zum Eintragen: siehe README von [mcp-install-for-claude-desktop](https://gitlab.zhaw.ch/enterprise-applications/mcp-install-for-claude-desktop).
+Beispiel für den Eintrag in `claude_desktop_config.json` (Pfad an die eigene Installation anpassen):
+
+```json
+{
+  "mcpServers": {
+    "outlook": {
+      "command": "C:\\Users\\<Benutzer>\\.mcp\\outlook\\.venv\\Scripts\\mcp-outlook-com.exe",
+      "env": {
+        "OUTLOOK_MCP_MAX_RESULTS": "50"
+      }
+    }
+  }
+}
+```
+
+Nach einer Änderung Claude Desktop vollständig beenden und neu starten.
 
 ## Voraussetzungen
 
@@ -119,4 +133,3 @@ Bei jedem Push auf `main` und jedem Pull-Request baut der Workflow `CI` das Whee
    ```
 
 3. Der Workflow `Release` prüft, dass Tag und Version übereinstimmen, baut das Wheel und erstellt den [Release](https://github.com/StefanZHAW/mcp-outlook-com/releases) mit dem Wheel, der Prüfsumme (SHA256) und automatisch erzeugten Release Notes. Die Release Notes lassen sich danach auf GitHub ergänzen.
-4. In `Install-ClaudeMcp.ps1` (mcp-install-for-claude-desktop) `$OutlookVersion` und `$OutlookWheelSha256` auf die Werte aus dem Release setzen. Erst damit kommt die neue Version auf die Rechner.

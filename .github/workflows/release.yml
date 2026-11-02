@@ -51,15 +51,6 @@ jobs:
           cat > notes.md <<EOF
           ## Installation
 
-          Mit \`Install-ClaudeMcp.ps1\` aus [mcp-install-for-claude-desktop](https://gitlab.zhaw.ch/enterprise-applications/mcp-install-for-claude-desktop) (Komponente \`outlook\`). Dort Version und Prüfsumme anpassen:
-
-          \`\`\`powershell
-          \$OutlookVersion      = "$VERSION"
-          \$OutlookWheelSha256  = "$sha256"
-          \`\`\`
-
-          Von Hand:
-
           \`\`\`bash
           pip install $url
           \`\`\`
