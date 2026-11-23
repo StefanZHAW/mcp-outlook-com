@@ -4,8 +4,8 @@ Outlook MCP Server für Claude Desktop.
 Greift über das COM-Objektmodell auf das klassische Outlook zu und
 stellt Werkzeuge zum Lesen und Durchsuchen von E-Mails,
 Kalendereinträgen und Anhängen bereit. Schreibend werden nur
-E-Mail-Entwürfe angelegt (neu, Antwort, Weiterleitung) und
-ungesendete Entwürfe im Ordner Entwürfe bearbeitet. Besprechungs-
+E-Mail-Entwürfe angelegt (neu, Antwort, Weiterleitung); bestehende
+Entwürfe werden nie geändert. Besprechungs-
 einladungen werden vorbefüllt in einem Outlook-Fenster geöffnet,
 aber nicht gespeichert. Es wird nichts
 gesendet, verschoben oder gelöscht; dafür gibt es bewusst kein
@@ -1530,6 +1530,7 @@ SENSITIVITY_VALUES = {"normal": 0, "persönlich": 1, "persoenlich": 1, "personal
                       "privat": 2, "private": 2, "vertraulich": 3, "confidential": 3}
 PR_FLAG_STATUS = "http://schemas.microsoft.com/mapi/proptag/0x10900003"
 FOLLOW_UP_TEXT = "Zur Nachverfolgung"
+DRAFTS_FOLDER = 16
 NO_DATE = datetime(4501, 1, 1)  # Outlook: "kein Datum"
 INLINE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp"}
 MAX_DRAFT_FILES = 20
@@ -1697,7 +1698,7 @@ def _signature_html(item, name: str) -> str:
         return f"{m.group(1)}cid:{cid}{m.group(3)}"
 
     markup = re.sub(r"""(?i)(<img\b[^>]*?\bsrc\s*=\s*["'])([^"']+)(["'])""", embed, markup)
-    # Lesezeichen wie bei der Outlook-Signatur, damit update_draft sie erkennt.
+    # Lesezeichen wie bei der Signatur, die Outlook selbst einfügt.
     return ('<p class=MsoNormal><o:p>&nbsp;</o:p></p>'
             '<p class=MsoNormal><a name="_MailAutoSig"></a><o:p></o:p></p>' + markup)
 
@@ -1776,19 +1777,6 @@ def _copy_attachments(original, item) -> list[str]:
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     return names
-
-
-def _remove_attachments(item, wanted) -> list[str]:
-    attachments = item.Attachments
-    count = int(attachments.Count)
-    names = [_attachment_name(attachments.Item(n)) for n in range(1, count + 1)]
-    indexes = sorted({_pick(names, str(w), "Entwurf") + 1 for w in wanted or []},
-                     reverse=True)
-    removed = []
-    for index in indexes:
-        removed.append(names[index - 1])
-        attachments.Remove(index)
-    return removed
 
 
 # ---- Eigenschaften ----
@@ -2019,146 +2007,6 @@ def _list_drafts_impl(query, limit) -> dict:
     drafts.sort(key=lambda d: d.get("geaendert") or "", reverse=True)
     return {"anzahl": min(len(drafts), limit), "entwuerfe": drafts[:limit]}
 
-
-# Wo der eigene Text eines Entwurfs endet: vor der Signatur (Lesezeichen
-# _MailAutoSig) oder vor dem Kopf der zitierten bzw. weitergeleiteten Mail.
-DRAFT_BOUNDARIES = (
-    re.compile(r"<p\b[^>]*>\s*(?:<(?!/?p\b)[^>]+>\s*)*<a\s+name=\"?_MailAutoSig\b", re.I),
-    re.compile(r"<div\b[^>]*border-top:\s*solid\s+#E1E1E1", re.I),
-    re.compile(r"<div\b[^>]*id=\"?(?:appendonsend|divRplyFwdMsg)\b", re.I),
-    re.compile(r"<p\b[^>]*>\s*(?:<(?!/?p\b)[^>]+>\s*)*<a\s+name=\"?_MailOriginal\b", re.I),
-)
-# Leere Absätze direkt vor Signatur bzw. Zitat (Abstand) bleiben erhalten.
-TRAILING_EMPTY = re.compile(
-    r"(?:\s*<p\b[^>]*>\s*(?:<span\b[^>]*>\s*)*(?:<o:p>)?\s*(?:&nbsp;|\xa0)?\s*"
-    r"(?:</o:p>)?\s*(?:</span>\s*)*</p>)*\s*$", re.I)
-BODY_END = re.compile(r"(?:</div>\s*)?</body>", re.I)
-DRAFTS_FOLDER = 16
-DRAFT_BODY_MODES = ("replace", "prepend", "append")
-
-
-def _own_text_range(body: str) -> tuple[int, int, int]:
-    """(Beginn, Ende des eigenen Texts, Beginn der leeren Absätze davor)."""
-    start_match = BODY_START.search(body)
-    start = start_match.end() if start_match else 0
-    ends = [m.start() for rx in DRAFT_BOUNDARIES
-            if (m := rx.search(body, start))]
-    if ends:
-        end = min(ends)
-    else:
-        end_match = BODY_END.search(body, start)
-        end = end_match.start() if end_match else len(body)
-    region = body[start:end]
-    trailing = TRAILING_EMPTY.search(region)
-    keep_from = start + (trailing.start() if trailing else len(region))
-    return start, end, keep_from
-
-
-def _replace_own_text(item, fragment: str, mode: str) -> None:
-    if _safe(item, "BodyFormat") != FORMAT_HTML:
-        item.BodyFormat = FORMAT_HTML
-    body = _safe(item, "HTMLBody", "") or ""
-    start, end, keep_from = _own_text_range(body)
-    if mode == "prepend":
-        body = body[:start] + fragment + body[start:]
-    elif mode == "append":
-        body = body[:keep_from] + fragment + body[keep_from:]
-    else:
-        body = body[:start] + fragment + body[keep_from:]
-    item.HTMLBody = body
-
-
-def _open_draft(entry_id: str, store_id: str):
-    """Nur ungesendete E-Mails im Ordner Entwürfe ihres Postfachs."""
-    item = _open_item(entry_id, store_id)
-    if _safe(item, "Class") != CLASS_MAIL:
-        raise ValueError("Das Element ist keine E-Mail.")
-    if _safe(item, "Sent", False):
-        raise ValueError("Die Mail wurde bereits gesendet und ist kein Entwurf.")
-    folder = _safe(item, "Parent")
-    try:
-        drafts = folder.Store.GetDefaultFolder(DRAFTS_FOLDER)
-        is_drafts = _safe(drafts, "EntryID", "") == _safe(folder, "EntryID", "")
-    except Exception:
-        is_drafts = False
-    if not is_drafts:
-        raise ValueError("Geändert werden nur Entwürfe im Ordner Entwürfe "
-                         f"(gefunden in '{_folder_path(folder)}').")
-    entry = _safe(item, "EntryID", "")
-    try:
-        for inspector in _namespace().Application.Inspectors:
-            if _safe(_safe(inspector, "CurrentItem"), "EntryID", "") == entry:
-                raise ValueError("Der Entwurf ist in Outlook in einem Fenster geöffnet. "
-                                 "Fenster zuerst schliessen, damit keine Änderungen "
-                                 "verloren gehen.")
-    except pywintypes.com_error:
-        pass
-    return item
-
-
-def _replace_recipients(item, kind: int, addresses) -> None:
-    if addresses is None:
-        return  # unverändert
-    recipients = item.Recipients
-    for nr in range(int(recipients.Count), 0, -1):
-        if _safe(recipients.Item(nr), "Type") == kind:
-            recipients.Remove(nr)
-    _set_recipients(item, kind, addresses)
-
-
-MAIL_OPTION_KEYS = ("importance", "sensitivity", "read_receipt", "delivery_receipt",
-                    "categories", "follow_up", "follow_up_due", "deferred_delivery",
-                    "expires")
-
-
-def _update_draft_impl(entry_id, store_id, subject, body, body_mode, body_is_html,
-                       to, cc, bcc, add_to, add_cc, add_bcc, open_in_outlook,
-                       remove_attachments=None, options=None) -> dict:
-    options = options or {}
-    mode = (body_mode or "replace").strip().lower()
-    if mode not in DRAFT_BODY_MODES:
-        raise ValueError("body_mode muss 'replace', 'prepend' oder 'append' sein.")
-    has_options = any(options.get(k) not in (None, "") for k in MAIL_OPTION_KEYS) or \
-        options.get("categories") is not None or options.get("attachments") or \
-        options.get("inline_images")
-    if (subject is None and body is None and to is None and cc is None and bcc is None
-            and not add_to and not add_cc and not add_bcc and not remove_attachments
-            and not has_options and not open_in_outlook):
-        raise ValueError("Keine Änderung angegeben.")
-    item = _open_draft(entry_id, store_id)
-    changes = []
-    if subject is not None:
-        item.Subject = subject
-        changes.append("Betreff")
-    for kind, replace, add, label in ((RECIPIENT_TO, to, add_to, "An"),
-                                      (RECIPIENT_CC, cc, add_cc, "Cc"),
-                                      (RECIPIENT_BCC, bcc, add_bcc, "Bcc")):
-        if replace is not None:
-            _replace_recipients(item, kind, replace)
-            changes.append(f"{label} ersetzt")
-        if add:
-            _set_recipients(item, kind, add)
-            changes.append(f"{label} ergänzt")
-    if remove_attachments:
-        changes.append("Anhänge entfernt: " + ", ".join(
-            _remove_attachments(item, remove_attachments)))
-    images = _embed_images(item, options.get("inline_images"))
-    if body is not None or images:
-        fragment = _body_html(body or "", body_is_html, options.get("font"),
-                              options.get("font_size"), images)
-        effective = mode if body is not None else "append"
-        _replace_own_text(item, fragment, effective)
-        changes.append({"replace": "Text ersetzt", "prepend": "Text vorangestellt",
-                        "append": "Text angefügt"}[effective])
-    changes += _apply_mail_options(item, options)
-    attached = _attach_files(item, options.get("attachments"))
-    if attached:
-        changes.append("Anhänge: " + ", ".join(attached))
-    result = _save_draft(item, open_in_outlook)
-    result["aenderungen"] = changes
-    result["hinweis"] = ("Entwurf geändert und gespeichert, nicht gesendet. "
-                         "Gesendet wird nur von Hand in Outlook.")
-    return result
 
 
 # ============================================================
@@ -3401,8 +3249,8 @@ mcp = FastMCP(
         "liefert list_open_invitations, Besprechungsräume list_rooms. "
         "Entwürfe mit create_draft, "
         "create_reply_draft und create_forward_draft anlegen (mit Anhängen, "
-        "Bildern, Signatur und Eigenschaften wie Wichtigkeit), bestehende "
-        "Entwürfe mit list_drafts finden und mit update_draft ändern. "
+        "Bildern, Signatur und Eigenschaften wie Wichtigkeit) und mit "
+        "list_drafts auflisten. Bestehende Entwürfe werden nicht geändert. "
         "Besprechungseinladungen öffnet "
         "open_meeting_draft vorbefüllt in einem Outlook-Fenster, ohne zu "
         "speichern. Senden und Löschen ist nicht möglich: Entwürfe und "
@@ -3691,17 +3539,16 @@ async def list_rooms(
 
 
 MAIL_OPTIONS_DOC = """
-    Gemeinsame Optionen (leer bzw. nicht angegeben = unverändert bzw.
-    Outlook-Standard):
+    Gemeinsame Optionen (leer bzw. nicht angegeben = Outlook-Standard):
     importance: 'niedrig', 'normal' oder 'hoch'.
     sensitivity: 'normal', 'persönlich', 'privat' oder 'vertraulich'.
     read_receipt / delivery_receipt: Lese- bzw. Zustellbestätigung anfordern.
-    categories: Kategorien, durch Komma getrennt ('' entfernt sie).
-    follow_up: Zur Nachverfolgung kennzeichnen (false entfernt die
-        Kennzeichnung). follow_up_due: Fälligkeit (JJJJ-MM-TT).
+    categories: Kategorien, durch Komma getrennt.
+    follow_up: Für die Empfänger zur Nachverfolgung kennzeichnen.
+    follow_up_due: Fälligkeit der Kennzeichnung (JJJJ-MM-TT).
     deferred_delivery: Erst ab diesem Zeitpunkt zustellen (JJJJ-MM-TT HH:MM),
-        wirkt erst beim Senden in Outlook ('' entfernt).
-    expires: Ablaufdatum der Mail (JJJJ-MM-TT HH:MM, '' entfernt).
+        wirkt erst beim Senden in Outlook.
+    expires: Ablaufdatum der Mail (JJJJ-MM-TT HH:MM).
     font / font_size: Schrift und Grösse (pt) für den Text dieses Entwurfs,
         Standard aus OUTLOOK_MCP_DRAFT_FONT; font='' = Formatvorlage der Mail.
     attachments: Pfade lokaler Dateien, die angehängt werden.
@@ -3732,8 +3579,7 @@ def _mail_options(importance, sensitivity, read_receipt, delivery_receipt, categ
 @mcp.tool()
 async def list_drafts(query: str = "", limit: int = 20) -> dict:
     """Listet die Entwürfe aller eingebundenen Postfächer, zuletzt
-    geänderte zuerst, mit Empfängern, Anhängen und Eigenschaften. Die
-    entry_id dient für update_draft.
+    geänderte zuerst, mit Empfängern, Anhängen und Eigenschaften.
 
     query: Teil von Betreff oder Empfängern.
     limit: Maximale Anzahl Entwürfe.
@@ -3877,8 +3723,6 @@ async def create_forward_draft(
     """Legt eine Weiterleitung einer E-Mail als Entwurf an, mit allen
     Anhängen der Originalmail. Der Text steht über Signatur und
     weitergeleiteter Mail. Die Weiterleitung wird nicht gesendet.
-    Einzelne Originalanhänge lassen sich danach mit update_draft
-    (remove_attachments) entfernen.
 
     entry_id / store_id: Werte aus search_mails.
     to / cc / bcc: E-Mail-Adressen der Empfängerinnen und Empfänger.
@@ -3895,65 +3739,6 @@ async def create_forward_draft(
     return await _run(_create_forward_draft_impl, entry_id, store_id, to, cc,
                       bcc, body, body_is_html, open_in_outlook, subject,
                       signature, options)
-
-
-@mcp.tool()
-@_with_doc(MAIL_OPTIONS_DOC)
-async def update_draft(
-    entry_id: str,
-    store_id: str = "",
-    subject: str | None = None,
-    body: str | None = None,
-    body_mode: str = "replace",
-    body_is_html: bool = False,
-    to: list[str] | None = None,
-    cc: list[str] | None = None,
-    bcc: list[str] | None = None,
-    add_to: list[str] | None = None,
-    add_cc: list[str] | None = None,
-    add_bcc: list[str] | None = None,
-    open_in_outlook: bool = False,
-    remove_attachments: list[str] | None = None,
-    importance: str = "",
-    sensitivity: str = "",
-    read_receipt: bool | None = None,
-    delivery_receipt: bool | None = None,
-    categories: str | None = None,
-    follow_up: bool | None = None,
-    follow_up_due: str = "",
-    deferred_delivery: str | None = None,
-    expires: str | None = None,
-    font: str | None = None,
-    font_size: int | None = None,
-    attachments: list[str] | None = None,
-    inline_images: list[str] | None = None,
-) -> dict:
-    """Ändert einen bestehenden, ungesendeten Entwurf im Ordner Entwürfe:
-    Betreff, Empfängerinnen und Empfänger, den eigenen Text, Anhänge und
-    Eigenschaften. Signatur und zitierte bzw. weitergeleitete Mail bleiben
-    erhalten. Der Entwurf wird gespeichert, nicht gesendet. Nicht
-    angegebene Felder bleiben unverändert. Ist der Entwurf in Outlook in
-    einem Fenster geöffnet, wird er nicht geändert.
-
-    entry_id / store_id: Werte des Entwurfs, z. B. aus list_drafts.
-    subject: Neuer Betreff.
-    body: Neuer Text, Zeilenumbrüche werden übernommen.
-    body_mode: 'replace' ersetzt den eigenen Text oberhalb von Signatur
-        und Zitat (Standard), 'prepend' stellt den Text voran, 'append'
-        fügt ihn am Ende des eigenen Texts an.
-    body_is_html: body ist ein HTML-Fragment.
-    to / cc / bcc: Ersetzen alle bisherigen Adressen dieser Art; eine
-        leere Liste entfernt sie.
-    add_to / add_cc / add_bcc: Ergänzen Adressen, bisherige bleiben.
-    open_in_outlook: Entwurf danach in einem Outlook-Fenster öffnen.
-    remove_attachments: Anhänge entfernen, als Nummer oder Name.
-    """
-    options = _mail_options(importance, sensitivity, read_receipt, delivery_receipt,
-                            categories, follow_up, follow_up_due, deferred_delivery,
-                            expires, font, font_size, attachments, inline_images)
-    return await _run(_update_draft_impl, entry_id, store_id, subject, body,
-                      body_mode, body_is_html, to, cc, bcc, add_to, add_cc,
-                      add_bcc, open_in_outlook, remove_attachments, options)
 
 
 @mcp.tool()

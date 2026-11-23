@@ -2,7 +2,7 @@
 
 MCP server for **Claude Desktop**: read access to emails, calendars and attachments in **classic Outlook** via the COM object model, plus creating email drafts and preparing meeting invitations.
 
-The only write operations are creating drafts (new mail, reply, forward) and changing unsent drafts in the Drafts folder. Meeting invitations are opened pre-filled in an Outlook window but not saved. Nothing is sent, moved or deleted; there is deliberately no tool for that. Reading a mail does not mark it as read. Attachments are saved briefly to a temporary directory for reading and deleted afterwards.
+The only write operations are creating drafts (new mail, reply, forward); existing drafts are never modified. Meeting invitations are opened pre-filled in an Outlook window but not saved. Nothing is sent, moved or deleted; there is deliberately no tool for that. Reading a mail does not mark it as read. Attachments are saved briefly to a temporary directory for reading and deleted afterwards.
 
 ## Installation
 
@@ -40,7 +40,6 @@ Start the server with `mcp-outlook-com.exe` from the virtual environment or with
 | `create_draft` | New mail as a draft, with signature, attachments, inline images and properties |
 | `create_reply_draft` | Reply or reply all as a draft, text above signature and quoted mail, optionally with own subject and the original attachments |
 | `create_forward_draft` | Forward as a draft, with the attachments of the original mail, optionally with own subject |
-| `update_draft` | Change an unsent draft: subject, recipients, own text, attachments and properties; signature and quoted mail are kept |
 | `open_meeting_draft` | Open a pre-filled meeting invitation in an Outlook window without saving it: all-day, recurring, show as, reminder, private, categories, attachments, formatted text |
 
 ### Drafts
@@ -53,7 +52,7 @@ Drafts are stored in the Drafts folder with `Save` and never sent. Sending is do
 - Properties: `importance`, `sensitivity`, `read_receipt`, `delivery_receipt`, `categories`, `follow_up` with `follow_up_due` (flag for recipients; Outlook does not allow flagging drafts for oneself), `deferred_delivery` (takes effect when the mail is sent in Outlook) and `expires`.
 - `attachments` attaches local files, `inline_images` embeds local images in the text (hidden attachments with a Content-ID); with `body_is_html` they are placed with `<img src="cid:file name">`, otherwise they follow the text. At most 20 files and `OUTLOOK_MCP_MAX_DRAFT_ATTACHMENT_BYTES` in total per call.
 - `create_reply_draft` with `include_attachments` takes over the attachments of the original mail, without images that only appear in the text (e.g. logos). `subject` replaces "AW: …" or "WG: …".
-- `update_draft` changes only unsent mails in the Drafts folder of their mailbox, and only if the draft is not open in an Outlook window. Besides text and recipients it changes the properties above, adds files and images and removes attachments (`remove_attachments`, by number or name). The own text is the part above the signature (bookmark `_MailAutoSig`) and above the quoted or forwarded mail; `body_mode` replaces it (`replace`, default), puts the new text before it (`prepend`) or after it (`append`). `to`, `cc` and `bcc` replace all addresses of that kind (an empty list removes them), `add_to`, `add_cc` and `add_bcc` add addresses.
+- Once created, drafts are no longer modified by the server. Make corrections in Outlook or create a new draft.
 - The original mail is not modified when replying or forwarding.
 
 ### Meeting invitations
