@@ -1,6 +1,6 @@
 [project]
 name = "mcp-outlook-com"
-version = "1.1.0"
+version = "1.2.0"
 description = "MCP-Server für Claude Desktop: E-Mails und Kalender im klassischen Outlook über COM"
 readme = "README.md"
 requires-python = ">=3.12"

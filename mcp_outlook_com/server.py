@@ -33,6 +33,7 @@ import struct
 import sys
 import tempfile
 import time
+import urllib.parse
 import xml.etree.ElementTree as ET
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -82,6 +83,10 @@ MAX_ATTACHMENT_CHARS = _env_int("OUTLOOK_MCP_MAX_ATTACHMENT_CHARS", 30000)
 # mehr als ca. 1568 Pixel Kantenlänge ohnehin herunter.
 MAX_IMAGE_BYTES = _env_int("OUTLOOK_MCP_MAX_IMAGE_BYTES", 3_500_000)
 MAX_IMAGE_EDGE = _env_int("OUTLOOK_MCP_MAX_IMAGE_EDGE", 1568)
+# Seiten gescannter PDFs pro get_attachment-Aufruf (als Bilder).
+MAX_PDF_IMAGE_PAGES = _env_int("OUTLOOK_MCP_MAX_PDF_IMAGE_PAGES", 3)
+# Wie tief member in verschachtelte Anhänge hineinführen darf.
+MAX_MEMBER_DEPTH = 3
 # Schrift für den Text von Entwürfen, direkt am Absatz gesetzt, damit
 # sie in jedem Outlook gleich erscheint. Leere Schriftart = Formatvorlage
 # der Mail (bei Antworten oft die Schrift der Originalmail).
@@ -654,6 +659,13 @@ def _flag_info(item) -> dict | None:
         value = _fmt(_dt(_safe(item, attr)))
         if value:
             info[key] = value[:10]
+    if "faellig" not in info:
+        due = _safe(item, "FlagDueBy")  # Kennzeichnung für Empfänger
+        if getattr(due, "tzinfo", None) is not None:
+            due = due.replace(tzinfo=None)  # als Ortszeit gespeichert
+        value = _fmt(_dt(due))
+        if value:
+            info["faellig"] = value
     return info
 
 
@@ -1048,6 +1060,10 @@ def _recurrence_info(pattern) -> dict:
         "ohne_ende": no_end,
         "anzahl_vorkommen": None if no_end else _safe(pattern, "Occurrences"),
     }
+    duration = int(_safe(pattern, "Duration", 0) or 0)
+    if duration and duration % 1440 == 0 and info["uhrzeit_von"] in (None, "00:00"):
+        info["ganztaegig"] = True
+        info["uhrzeit_von"] = info["uhrzeit_bis"] = None
     info["beschreibung"] = _recurrence_text(info, rtype, interval, mask, day,
                                             month, instance)
     return {k: v for k, v in info.items() if v is not None}
@@ -1509,19 +1525,34 @@ BODY_START = re.compile(
 BLOCK_TAG = re.compile(r"<(p|li|td|th|div|h[1-6])\b([^>]*)>", re.I)
 STYLE_ATTR = re.compile(r"""\bstyle\s*=\s*(["'])""", re.I)
 
+PR_ATTACHMENT_HIDDEN = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B"
+SENSITIVITY_VALUES = {"normal": 0, "persönlich": 1, "persoenlich": 1, "personal": 1,
+                      "privat": 2, "private": 2, "vertraulich": 3, "confidential": 3}
+PR_FLAG_STATUS = "http://schemas.microsoft.com/mapi/proptag/0x10900003"
+FOLLOW_UP_TEXT = "Zur Nachverfolgung"
+NO_DATE = datetime(4501, 1, 1)  # Outlook: "kein Datum"
+INLINE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp"}
+MAX_DRAFT_FILES = 20
+MAX_DRAFT_ATTACHMENT_BYTES = _env_int("OUTLOOK_MCP_MAX_DRAFT_ATTACHMENT_BYTES", 25_000_000)
+SIGNATURE_DEFAULT = ("", "standard", "default")
+SIGNATURE_NONE = ("keine", "none", "ohne")
+SIGNATURE_FOLDERS = ("Signatures", "Signaturen", "Signaturer", "Firmas", "Signatures (1)")
 
-def _font_css() -> str:
-    if not DRAFT_FONT:
+
+def _font_css(font: str | None = None, size: int | None = None) -> str:
+    name = DRAFT_FONT if font is None else font.strip().strip('"')
+    if not name:
         return ""
-    return (f"font-family:&quot;{html.escape(DRAFT_FONT)}&quot;,sans-serif;"
-            f"font-size:{max(6, min(DRAFT_FONT_SIZE, 72))}.0pt")
+    points = DRAFT_FONT_SIZE if not size else int(size)
+    return (f"font-family:&quot;{html.escape(name)}&quot;,sans-serif;"
+            f"font-size:{max(6, min(points, 72))}.0pt")
 
 
-def _with_font(fragment: str) -> str:
+def _with_font(fragment: str, font: str | None = None, size: int | None = None) -> str:
     """Schrift an jedem Block setzen. Die Formatvorlage der Mail legt
     die Schrift für Absätze fest, ein umschliessendes Element genügt
     deshalb nicht. Eigene Angaben im Fragment haben Vorrang."""
-    css = _font_css()
+    css = _font_css(font, size)
     if not css:
         return fragment
 
@@ -1537,14 +1568,28 @@ def _with_font(fragment: str) -> str:
     return f'<div style="{css}">' + BLOCK_TAG.sub(add, fragment) + "</div>"
 
 
-def _body_html(text: str, is_html: bool) -> str:
+def _body_html(text: str, is_html: bool, font: str | None = None,
+               size: int | None = None, images: list[tuple[str, str]] | None = None) -> str:
+    """HTML-Fragment für den eigenen Text. images: (Dateiname, cid) der
+    eingebetteten Bilder; im HTML mit src="cid:Dateiname" platzierte
+    Bilder bleiben dort, alle übrigen folgen am Ende des Texts."""
+    images = images or []
     if is_html:
-        return _with_font(text or "")
-    # Absätze im Stil der Outlook-Vorlage (Abstände), Schrift aus _with_font.
-    lines = (text or "").replace("\r\n", "\n").strip("\n").split("\n")
-    return _with_font("".join(
-        f"<p class=MsoNormal>{html.escape(line) if line.strip() else '&nbsp;'}</p>"
-        for line in lines))
+        fragment = text or ""
+    else:
+        lines = (text or "").replace("\r\n", "\n").strip("\n").split("\n") if text else []
+        # Absätze im Stil der Outlook-Vorlage (Abstände), Schrift aus _with_font.
+        fragment = "".join(
+            f"<p class=MsoNormal>{html.escape(line) if line.strip() else '&nbsp;'}</p>"
+            for line in lines)
+    for name, cid in images:
+        pattern = re.compile(r"cid:" + re.escape(name) + r"(?=[\"'\s>])", re.I)
+        if is_html and pattern.search(fragment):
+            fragment = pattern.sub(f"cid:{cid}", fragment)
+        else:
+            fragment += (f'<p class=MsoNormal><img src="cid:{cid}" '
+                         f'alt="{html.escape(name)}"></p>')
+    return _with_font(fragment, font, size)
 
 
 def _insert_body(item, fragment: str) -> None:
@@ -1577,6 +1622,238 @@ def _with_signature(item):
     return item
 
 
+# ---- Signaturen ----
+
+def _signature_dir() -> str | None:
+    base = os.path.join(os.environ.get("APPDATA", ""), "Microsoft")
+    for name in SIGNATURE_FOLDERS:
+        path = os.path.join(base, name)
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+def _signature_names() -> list[str]:
+    folder = _signature_dir()
+    if not folder:
+        return []
+    return sorted(os.path.splitext(f)[0] for f in os.listdir(folder)
+                  if f.lower().endswith((".htm", ".html")))
+
+
+def _list_signatures_impl() -> dict:
+    return {
+        "ordner": _signature_dir(),
+        "signaturen": _signature_names(),
+        "hinweis": ("Name als 'signature' bei create_draft, create_reply_draft "
+                    "oder create_forward_draft angeben. Leer = Standardsignatur "
+                    "von Outlook, 'keine' = ohne Signatur."),
+    }
+
+
+def _signature_mode(signature: str | None) -> str:
+    """'default', 'none' oder der Name einer Signatur."""
+    value = (signature or "").strip()
+    if value.lower() in SIGNATURE_DEFAULT:
+        return "default"
+    if value.lower() in SIGNATURE_NONE:
+        return "none"
+    return value
+
+
+def _signature_html(item, name: str) -> str:
+    folder = _signature_dir()
+    names = _signature_names()
+    match = next((n for n in names if n.lower() == name.lower()), None)
+    if not folder or match is None:
+        raise ValueError(f"Signatur '{name}' nicht gefunden. Vorhanden: "
+                         + (", ".join(names) or "keine") + ".")
+    path = os.path.join(folder, match + ".htm")
+    if not os.path.exists(path):
+        path += "l"
+    data = _read_bytes(path)
+    charset = re.search(rb"charset\s*=\s*[\"']?([\w-]+)", data[:3000], re.I)
+    try:
+        markup = data.decode(charset.group(1).decode() if charset else "cp1252")
+    except (LookupError, UnicodeDecodeError):
+        markup = _decode(data)
+    body = re.search(r"(?is)<body\b[^>]*>(.*)</body\s*>", markup)
+    markup = body.group(1) if body else markup
+    # VML-Varianten von Word entfernen, die Bild-Alternative behalten.
+    markup = re.sub(r"(?is)<!--\[if gte vml 1\]>.*?<!\[endif\]-->", "", markup)
+    markup = re.sub(r"(?i)<!\[if !vml\]>|<!\[endif\]>", "", markup)
+
+    counter = [0]
+
+    def embed(m):
+        src = html.unescape(m.group(2))
+        if re.match(r"(?i)^(https?:|cid:|data:)", src):
+            return m.group(0)
+        file = os.path.normpath(os.path.join(folder, urllib.parse.unquote(src)))
+        if not file.startswith(os.path.normpath(folder)) or not os.path.isfile(file):
+            return m.group(0)
+        counter[0] += 1
+        cid = _embed_file(item, file, f"sig{counter[0]}")
+        return f"{m.group(1)}cid:{cid}{m.group(3)}"
+
+    markup = re.sub(r"""(?i)(<img\b[^>]*?\bsrc\s*=\s*["'])([^"']+)(["'])""", embed, markup)
+    # Lesezeichen wie bei der Outlook-Signatur, damit update_draft sie erkennt.
+    return ('<p class=MsoNormal><o:p>&nbsp;</o:p></p>'
+            '<p class=MsoNormal><a name="_MailAutoSig"></a><o:p></o:p></p>' + markup)
+
+
+# ---- Dateien ----
+
+def _file_paths(paths, kind: str) -> list[str]:
+    files = []
+    for raw in paths or []:
+        path = os.path.abspath(os.path.expandvars(os.path.expanduser((raw or "").strip())))
+        if not raw or not os.path.isfile(path):
+            raise ValueError(f"{kind} nicht gefunden: '{raw}'")
+        files.append(path)
+    if len(files) > MAX_DRAFT_FILES:
+        raise ValueError(f"Höchstens {MAX_DRAFT_FILES} Dateien pro Aufruf.")
+    total = sum(os.path.getsize(f) for f in files)
+    if total > MAX_DRAFT_ATTACHMENT_BYTES:
+        raise ValueError(f"Dateien zu gross ({total} Bytes, max. {MAX_DRAFT_ATTACHMENT_BYTES}).")
+    return files
+
+
+def _embed_file(item, path: str, prefix: str) -> str:
+    """Bild als verborgenen Anhang mit Content-ID einbetten, liefert die cid."""
+    name = os.path.basename(path)
+    cid = f"{prefix}_{re.sub(r'[^A-Za-z0-9._-]', '_', name)}"
+    att = item.Attachments.Add(path, ATT_BY_VALUE, 0, name)
+    accessor = att.PropertyAccessor
+    accessor.SetProperty(PR_ATTACH_CONTENT_ID, cid)
+    accessor.SetProperty(PR_ATTACHMENT_HIDDEN, True)
+    return cid
+
+
+def _embed_images(item, paths) -> list[tuple[str, str]]:
+    files = _file_paths(paths, "Bild")
+    result = []
+    for nr, path in enumerate(files, 1):
+        if os.path.splitext(path)[1].lower() not in INLINE_IMAGE_EXTENSIONS:
+            raise ValueError(f"Nur Bilder können eingebettet werden "
+                             f"({', '.join(sorted(INLINE_IMAGE_EXTENSIONS))}): '{path}'")
+        result.append((os.path.basename(path), _embed_file(item, path, f"img{nr}")))
+    return result
+
+
+def _attach_files(item, paths) -> list[str]:
+    names = []
+    for path in _file_paths(paths, "Datei"):
+        item.Attachments.Add(path, ATT_BY_VALUE)
+        names.append(os.path.basename(path))
+    return names
+
+
+def _copy_attachments(original, item) -> list[str]:
+    """Anhänge der Originalmail übernehmen, ohne Bilder im Text (z. B. Logos)."""
+    html_body = _safe(original, "HTMLBody", "") or ""
+    names = []
+    tmpdir = tempfile.mkdtemp(prefix="outlook-mcp-")
+    try:
+        attachments = original.Attachments
+        for nr in range(1, int(attachments.Count) + 1):
+            att = attachments.Item(nr)
+            att_type = _safe(att, "Type")
+            if att_type == ATT_BY_REFERENCE:
+                continue
+            info = _attachment_info(att, nr, html_body)
+            if info.get("im_text_eingebettet"):
+                continue
+            name = re.sub(r'[\\/:*?"<>|]', "_", info["name"] or f"anhang{nr}")
+            if att_type == ATT_EMBEDDED and not name.lower().endswith(".msg"):
+                name += ".msg"
+            folder = os.path.join(tmpdir, str(nr))
+            os.makedirs(folder)
+            path = os.path.join(folder, name)
+            att.SaveAsFile(path)
+            item.Attachments.Add(path, ATT_BY_VALUE, 0, info["name"] or name)
+            names.append(info["name"] or name)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    return names
+
+
+def _remove_attachments(item, wanted) -> list[str]:
+    attachments = item.Attachments
+    count = int(attachments.Count)
+    names = [_attachment_name(attachments.Item(n)) for n in range(1, count + 1)]
+    indexes = sorted({_pick(names, str(w), "Entwurf") + 1 for w in wanted or []},
+                     reverse=True)
+    removed = []
+    for index in indexes:
+        removed.append(names[index - 1])
+        attachments.Remove(index)
+    return removed
+
+
+# ---- Eigenschaften ----
+
+def _option_date(value: str, name: str):
+    if not value.strip():
+        return _com_time(NO_DATE)
+    return _com_time(_parse_date(value, name))
+
+
+def _apply_mail_options(item, options: dict) -> list[str]:
+    """Eigenschaften setzen; None bedeutet jeweils unverändert."""
+    changes = []
+    value = options.get("importance")
+    if value:
+        key = value.strip().lower()
+        if key not in IMPORTANCE_VALUES:
+            raise ValueError("importance muss 'niedrig', 'normal' oder 'hoch' sein.")
+        item.Importance = IMPORTANCE_VALUES[key]
+        changes.append(f"Wichtigkeit {key}")
+    value = options.get("sensitivity")
+    if value:
+        key = value.strip().lower()
+        if key not in SENSITIVITY_VALUES:
+            raise ValueError("sensitivity muss 'normal', 'persönlich', 'privat' "
+                             "oder 'vertraulich' sein.")
+        item.Sensitivity = SENSITIVITY_VALUES[key]
+        changes.append(f"Vertraulichkeit {key}")
+    if options.get("read_receipt") is not None:
+        item.ReadReceiptRequested = bool(options["read_receipt"])
+        changes.append("Lesebestätigung " + ("an" if options["read_receipt"] else "aus"))
+    if options.get("delivery_receipt") is not None:
+        item.OriginatorDeliveryReportRequested = bool(options["delivery_receipt"])
+        changes.append("Zustellbestätigung " + ("an" if options["delivery_receipt"] else "aus"))
+    if options.get("categories") is not None:
+        item.Categories = options["categories"].strip()
+        changes.append("Kategorien")
+    follow_up = options.get("follow_up")
+    due = options.get("follow_up_due")
+    # Entwürfe lassen sich nicht als Aufgabe markieren (MarkAsTask). Wie
+    # "Kennzeichnung für Empfänger" in Outlook: Text, Fälligkeit, Status.
+    if follow_up is False:
+        item.FlagRequest = ""
+        item.PropertyAccessor.SetProperty(PR_FLAG_STATUS, 0)
+        changes.append("Kennzeichnung entfernt")
+    elif follow_up or due:
+        item.FlagRequest = FOLLOW_UP_TEXT
+        if due:
+            day = _parse_date(due, "follow_up_due")
+            if not _has_time(due):
+                day = day.replace(hour=17)
+            item.FlagDueBy = _com_time(day)
+        item.PropertyAccessor.SetProperty(PR_FLAG_STATUS, FLAG_MARKED)
+        changes.append("Kennzeichnung gesetzt")
+    if options.get("deferred_delivery") is not None:
+        item.DeferredDeliveryTime = _option_date(options["deferred_delivery"],
+                                                 "deferred_delivery")
+        changes.append("Übermittlung verzögert" if options["deferred_delivery"].strip()
+                       else "Verzögerte Übermittlung entfernt")
+    if options.get("expires") is not None:
+        item.ExpiryTime = _option_date(options["expires"], "expires")
+        changes.append("Ablaufdatum")
+    return changes
+
+
 def _set_recipients(item, kind: int, addresses) -> None:
     for address in _mailboxes(addresses):
         item.Recipients.Add(address).Type = kind
@@ -1599,11 +1876,9 @@ def _open_mail(entry_id: str, store_id: str):
     return item
 
 
-def _save_draft(item, open_in_outlook: bool) -> dict:
-    unresolved = _unresolved(item)
-    item.Save()
+def _draft_summary(item) -> dict:
     folder = _safe(item, "Parent")
-    result = {
+    summary = {
         "entry_id": _safe(item, "EntryID", ""),
         "store_id": _safe(folder, "StoreID", ""),
         "betreff": _safe(item, "Subject", ""),
@@ -1612,10 +1887,36 @@ def _save_draft(item, open_in_outlook: bool) -> dict:
         "bcc": _safe(item, "BCC", ""),
         "ordner": _folder_path(folder),
         "anhaenge": [a["name"] for a in _attachment_list(item)],
-        "vorschau": _truncate(_safe(item, "Body", ""), 1000),
-        "hinweis": ("Entwurf gespeichert, nicht gesendet. Gesendet wird "
-                    "nur von Hand in Outlook."),
     }
+    importance = _safe(item, "Importance", 1)
+    if importance != 1:
+        summary["wichtigkeit"] = IMPORTANCE.get(importance, "")
+    sensitivity = _safe(item, "Sensitivity", 0)
+    if sensitivity:
+        summary["vertraulichkeit"] = SENSITIVITY.get(sensitivity, "")
+    for key, attr in (("lesebestaetigung", "ReadReceiptRequested"),
+                      ("zustellbestaetigung", "OriginatorDeliveryReportRequested")):
+        if _safe(item, attr, False):
+            summary[key] = True
+    if _safe(item, "Categories", ""):
+        summary["kategorien"] = item.Categories
+    flag = _flag_info(item)
+    if flag:
+        summary["kennzeichnung"] = flag
+    for key, attr in (("zustellen_ab", "DeferredDeliveryTime"), ("laeuft_ab", "ExpiryTime")):
+        value = _fmt(_dt(_safe(item, attr)))
+        if value:
+            summary[key] = value
+    return summary
+
+
+def _save_draft(item, open_in_outlook: bool) -> dict:
+    unresolved = _unresolved(item)
+    item.Save()
+    result = _draft_summary(item)
+    result["vorschau"] = _truncate(_safe(item, "Body", ""), 1000)
+    result["hinweis"] = ("Entwurf gespeichert, nicht gesendet. Gesendet wird "
+                         "nur von Hand in Outlook.")
     if unresolved:
         result["nicht_aufgeloest"] = unresolved
     if open_in_outlook:
@@ -1628,38 +1929,236 @@ def _save_draft(item, open_in_outlook: bool) -> dict:
     return result
 
 
+def _compose_draft(item, body, body_is_html, signature, options) -> list[str]:
+    """Signatur, Text, Bilder, Anhänge und Eigenschaften eines neuen Entwurfs."""
+    mode = _signature_mode(signature)
+    if mode == "default":
+        _with_signature(item)
+    else:
+        item.BodyFormat = FORMAT_HTML
+    images = _embed_images(item, options.get("inline_images"))
+    fragment = ""
+    if body or images:
+        fragment = _body_html(body or "", body_is_html, options.get("font"),
+                              options.get("font_size"), images)
+    if mode not in ("default", "none"):
+        fragment += _signature_html(item, mode)
+    if fragment:
+        _insert_body(item, fragment)
+    changes = _apply_mail_options(item, options)
+    attached = _attach_files(item, options.get("attachments"))
+    if attached:
+        changes.append("Anhänge: " + ", ".join(attached))
+    return changes
+
+
 def _create_draft_impl(to, cc, bcc, subject, body, body_is_html,
-                       open_in_outlook) -> dict:
-    item = _with_signature(_namespace().Application.CreateItem(ITEM_TYPE_MAIL))
+                       open_in_outlook, signature=None, options=None) -> dict:
+    item = _namespace().Application.CreateItem(ITEM_TYPE_MAIL)
     item.Subject = subject or ""
     _set_recipients(item, RECIPIENT_TO, to)
     _set_recipients(item, RECIPIENT_CC, cc)
     _set_recipients(item, RECIPIENT_BCC, bcc)
-    if body:
-        _insert_body(item, _body_html(body, body_is_html))
+    _compose_draft(item, body, body_is_html, signature, options or {})
     return _save_draft(item, open_in_outlook)
 
 
 def _create_reply_draft_impl(entry_id, store_id, body, body_is_html, reply_all,
-                             cc, bcc, open_in_outlook) -> dict:
+                             cc, bcc, open_in_outlook, subject=None,
+                             include_attachments=False, signature=None,
+                             options=None) -> dict:
     original = _open_mail(entry_id, store_id)
-    item = _with_signature(original.ReplyAll() if reply_all else original.Reply())
+    item = original.ReplyAll() if reply_all else original.Reply()
+    if subject:
+        item.Subject = subject
     _set_recipients(item, RECIPIENT_CC, cc)
     _set_recipients(item, RECIPIENT_BCC, bcc)
-    if body:
-        _insert_body(item, _body_html(body, body_is_html))
+    _compose_draft(item, body, body_is_html, signature, options or {})
+    if include_attachments:
+        _copy_attachments(original, item)
     return _save_draft(item, open_in_outlook)
 
 
 def _create_forward_draft_impl(entry_id, store_id, to, cc, bcc, body,
-                               body_is_html, open_in_outlook) -> dict:
-    item = _with_signature(_open_mail(entry_id, store_id).Forward())
+                               body_is_html, open_in_outlook, subject=None,
+                               signature=None, options=None) -> dict:
+    item = _open_mail(entry_id, store_id).Forward()
+    if subject:
+        item.Subject = subject
     _set_recipients(item, RECIPIENT_TO, to)
     _set_recipients(item, RECIPIENT_CC, cc)
     _set_recipients(item, RECIPIENT_BCC, bcc)
-    if body:
-        _insert_body(item, _body_html(body, body_is_html))
+    _compose_draft(item, body, body_is_html, signature, options or {})
     return _save_draft(item, open_in_outlook)
+
+
+def _list_drafts_impl(query, limit) -> dict:
+    limit = _limit(limit)
+    needle = (query or "").strip().lower()
+    drafts = []
+    for store in _namespace().Stores:
+        try:
+            folder = store.GetDefaultFolder(DRAFTS_FOLDER)
+            items = folder.Items
+            items.Sort("[LastModificationTime]", True)
+        except pywintypes.com_error:
+            continue  # z. B. Archiv oder öffentliche Ordner
+        found = 0
+        item = items.GetFirst()
+        while item is not None and found < limit:
+            if _safe(item, "Class") == CLASS_MAIL:
+                summary = _draft_summary(item)
+                haystack = " ".join((summary["betreff"], summary["an"], summary["cc"])).lower()
+                if not needle or needle in haystack:
+                    summary["geaendert"] = _fmt(_dt(_safe(item, "LastModificationTime")))
+                    summary["postfach"] = _safe(store, "DisplayName", "")
+                    summary["vorschau"] = _truncate(_safe(item, "Body", ""), PREVIEW_CHARS)
+                    drafts.append(summary)
+                    found += 1
+            item = items.GetNext()
+    drafts.sort(key=lambda d: d.get("geaendert") or "", reverse=True)
+    return {"anzahl": min(len(drafts), limit), "entwuerfe": drafts[:limit]}
+
+
+# Wo der eigene Text eines Entwurfs endet: vor der Signatur (Lesezeichen
+# _MailAutoSig) oder vor dem Kopf der zitierten bzw. weitergeleiteten Mail.
+DRAFT_BOUNDARIES = (
+    re.compile(r"<p\b[^>]*>\s*(?:<(?!/?p\b)[^>]+>\s*)*<a\s+name=\"?_MailAutoSig\b", re.I),
+    re.compile(r"<div\b[^>]*border-top:\s*solid\s+#E1E1E1", re.I),
+    re.compile(r"<div\b[^>]*id=\"?(?:appendonsend|divRplyFwdMsg)\b", re.I),
+    re.compile(r"<p\b[^>]*>\s*(?:<(?!/?p\b)[^>]+>\s*)*<a\s+name=\"?_MailOriginal\b", re.I),
+)
+# Leere Absätze direkt vor Signatur bzw. Zitat (Abstand) bleiben erhalten.
+TRAILING_EMPTY = re.compile(
+    r"(?:\s*<p\b[^>]*>\s*(?:<span\b[^>]*>\s*)*(?:<o:p>)?\s*(?:&nbsp;|\xa0)?\s*"
+    r"(?:</o:p>)?\s*(?:</span>\s*)*</p>)*\s*$", re.I)
+BODY_END = re.compile(r"(?:</div>\s*)?</body>", re.I)
+DRAFTS_FOLDER = 16
+DRAFT_BODY_MODES = ("replace", "prepend", "append")
+
+
+def _own_text_range(body: str) -> tuple[int, int, int]:
+    """(Beginn, Ende des eigenen Texts, Beginn der leeren Absätze davor)."""
+    start_match = BODY_START.search(body)
+    start = start_match.end() if start_match else 0
+    ends = [m.start() for rx in DRAFT_BOUNDARIES
+            if (m := rx.search(body, start))]
+    if ends:
+        end = min(ends)
+    else:
+        end_match = BODY_END.search(body, start)
+        end = end_match.start() if end_match else len(body)
+    region = body[start:end]
+    trailing = TRAILING_EMPTY.search(region)
+    keep_from = start + (trailing.start() if trailing else len(region))
+    return start, end, keep_from
+
+
+def _replace_own_text(item, fragment: str, mode: str) -> None:
+    if _safe(item, "BodyFormat") != FORMAT_HTML:
+        item.BodyFormat = FORMAT_HTML
+    body = _safe(item, "HTMLBody", "") or ""
+    start, end, keep_from = _own_text_range(body)
+    if mode == "prepend":
+        body = body[:start] + fragment + body[start:]
+    elif mode == "append":
+        body = body[:keep_from] + fragment + body[keep_from:]
+    else:
+        body = body[:start] + fragment + body[keep_from:]
+    item.HTMLBody = body
+
+
+def _open_draft(entry_id: str, store_id: str):
+    """Nur ungesendete E-Mails im Ordner Entwürfe ihres Postfachs."""
+    item = _open_item(entry_id, store_id)
+    if _safe(item, "Class") != CLASS_MAIL:
+        raise ValueError("Das Element ist keine E-Mail.")
+    if _safe(item, "Sent", False):
+        raise ValueError("Die Mail wurde bereits gesendet und ist kein Entwurf.")
+    folder = _safe(item, "Parent")
+    try:
+        drafts = folder.Store.GetDefaultFolder(DRAFTS_FOLDER)
+        is_drafts = _safe(drafts, "EntryID", "") == _safe(folder, "EntryID", "")
+    except Exception:
+        is_drafts = False
+    if not is_drafts:
+        raise ValueError("Geändert werden nur Entwürfe im Ordner Entwürfe "
+                         f"(gefunden in '{_folder_path(folder)}').")
+    entry = _safe(item, "EntryID", "")
+    try:
+        for inspector in _namespace().Application.Inspectors:
+            if _safe(_safe(inspector, "CurrentItem"), "EntryID", "") == entry:
+                raise ValueError("Der Entwurf ist in Outlook in einem Fenster geöffnet. "
+                                 "Fenster zuerst schliessen, damit keine Änderungen "
+                                 "verloren gehen.")
+    except pywintypes.com_error:
+        pass
+    return item
+
+
+def _replace_recipients(item, kind: int, addresses) -> None:
+    if addresses is None:
+        return  # unverändert
+    recipients = item.Recipients
+    for nr in range(int(recipients.Count), 0, -1):
+        if _safe(recipients.Item(nr), "Type") == kind:
+            recipients.Remove(nr)
+    _set_recipients(item, kind, addresses)
+
+
+MAIL_OPTION_KEYS = ("importance", "sensitivity", "read_receipt", "delivery_receipt",
+                    "categories", "follow_up", "follow_up_due", "deferred_delivery",
+                    "expires")
+
+
+def _update_draft_impl(entry_id, store_id, subject, body, body_mode, body_is_html,
+                       to, cc, bcc, add_to, add_cc, add_bcc, open_in_outlook,
+                       remove_attachments=None, options=None) -> dict:
+    options = options or {}
+    mode = (body_mode or "replace").strip().lower()
+    if mode not in DRAFT_BODY_MODES:
+        raise ValueError("body_mode muss 'replace', 'prepend' oder 'append' sein.")
+    has_options = any(options.get(k) not in (None, "") for k in MAIL_OPTION_KEYS) or \
+        options.get("categories") is not None or options.get("attachments") or \
+        options.get("inline_images")
+    if (subject is None and body is None and to is None and cc is None and bcc is None
+            and not add_to and not add_cc and not add_bcc and not remove_attachments
+            and not has_options and not open_in_outlook):
+        raise ValueError("Keine Änderung angegeben.")
+    item = _open_draft(entry_id, store_id)
+    changes = []
+    if subject is not None:
+        item.Subject = subject
+        changes.append("Betreff")
+    for kind, replace, add, label in ((RECIPIENT_TO, to, add_to, "An"),
+                                      (RECIPIENT_CC, cc, add_cc, "Cc"),
+                                      (RECIPIENT_BCC, bcc, add_bcc, "Bcc")):
+        if replace is not None:
+            _replace_recipients(item, kind, replace)
+            changes.append(f"{label} ersetzt")
+        if add:
+            _set_recipients(item, kind, add)
+            changes.append(f"{label} ergänzt")
+    if remove_attachments:
+        changes.append("Anhänge entfernt: " + ", ".join(
+            _remove_attachments(item, remove_attachments)))
+    images = _embed_images(item, options.get("inline_images"))
+    if body is not None or images:
+        fragment = _body_html(body or "", body_is_html, options.get("font"),
+                              options.get("font_size"), images)
+        effective = mode if body is not None else "append"
+        _replace_own_text(item, fragment, effective)
+        changes.append({"replace": "Text ersetzt", "prepend": "Text vorangestellt",
+                        "append": "Text angefügt"}[effective])
+    changes += _apply_mail_options(item, options)
+    attached = _attach_files(item, options.get("attachments"))
+    if attached:
+        changes.append("Anhänge: " + ", ".join(attached))
+    result = _save_draft(item, open_in_outlook)
+    result["aenderungen"] = changes
+    result["hinweis"] = ("Entwurf geändert und gespeichert, nicht gesendet. "
+                         "Gesendet wird nur von Hand in Outlook.")
+    return result
 
 
 # ============================================================
@@ -1669,15 +2168,41 @@ def _create_forward_draft_impl(entry_id, store_id, to, cc, bcc, body,
 # von Hand.
 # ============================================================
 
+BUSY_VALUES = {"frei": 0, "free": 0, "mit vorbehalt": 1, "vorbehalt": 1, "tentative": 1,
+               "beschäftigt": 2, "beschaeftigt": 2, "busy": 2, "abwesend": 3,
+               "out of office": 3, "oof": 3, "anderswo tätig": 4,
+               "anderswo taetig": 4, "working elsewhere": 4}
+WEEKDAY_VALUES = {"montag": 2, "mo": 2, "monday": 2, "dienstag": 4, "di": 4, "tuesday": 4,
+                  "mittwoch": 8, "mi": 8, "wednesday": 8, "donnerstag": 16, "do": 16,
+                  "thursday": 16, "freitag": 32, "fr": 32, "friday": 32, "samstag": 64,
+                  "sa": 64, "saturday": 64, "sonntag": 1, "so": 1, "sunday": 1}
+WEEKDAY_BITS = (2, 4, 8, 16, 32, 64, 1)  # datetime.weekday(): Montag = 0
+RECURRENCE_VALUES = {"täglich": "daily", "taeglich": "daily", "daily": "daily",
+                     "werktags": "weekdays", "weekdays": "weekdays",
+                     "wöchentlich": "weekly", "woechentlich": "weekly", "weekly": "weekly",
+                     "monatlich": "monthly", "monthly": "monthly",
+                     "monatlich_wochentag": "monthly_nth", "monthly_nth": "monthly_nth",
+                     "jährlich": "yearly", "jaehrlich": "yearly", "yearly": "yearly"}
+
+
 def _com_time(dt: datetime) -> datetime:
     # pywin32 rechnet naive Zeiten nach UTC um, eine als UTC markierte
     # Zeit übernimmt es unverändert. Outlook liest sie als Ortszeit.
     return dt.replace(tzinfo=timezone.utc)
 
 
-def _meeting_period(start: str, end: str,
-                    duration_minutes: int) -> tuple[datetime, datetime]:
+def _meeting_period(start: str, end: str, duration_minutes: int,
+                    all_day: bool = False) -> tuple[datetime, datetime]:
     begin = _parse_date(start, "start")
+    if all_day:
+        if begin is None:
+            raise ValueError("start braucht ein Datum (JJJJ-MM-TT).")
+        begin = begin.replace(hour=0, minute=0)
+        last = _parse_date(end, "end") if end and end.strip() else begin
+        finish = last.replace(hour=0, minute=0) + timedelta(days=1)  # Ende inklusive
+        if finish <= begin:
+            raise ValueError("Das Ende muss nach dem Beginn liegen.")
+        return begin, finish
     if begin is None or not _has_time(start):
         raise ValueError("start braucht Datum und Uhrzeit (JJJJ-MM-TT HH:MM).")
     if end and end.strip():
@@ -1691,17 +2216,125 @@ def _meeting_period(start: str, end: str,
     return begin, finish
 
 
+def _weekday_mask(days, begin: datetime) -> int:
+    if not days:
+        return WEEKDAY_BITS[begin.weekday()]
+    mask = 0
+    for day in days:
+        key = (day or "").strip().lower().rstrip(".")
+        if key not in WEEKDAY_VALUES:
+            raise ValueError(f"Unbekannter Wochentag: '{day}'")
+        mask |= WEEKDAY_VALUES[key]
+    return mask
+
+
+def _apply_recurrence(item, begin: datetime, finish: datetime, all_day: bool,
+                      recurrence: str, interval: int, weekdays, end_date: str,
+                      count: int) -> dict:
+    kind = RECURRENCE_VALUES.get((recurrence or "").strip().lower())
+    if kind is None:
+        raise ValueError("recurrence muss 'täglich', 'werktags', 'wöchentlich', "
+                         "'monatlich', 'monatlich_wochentag' oder 'jährlich' sein.")
+    interval = max(1, int(interval or 1))
+    pattern = item.GetRecurrencePattern()
+    if kind == "daily":
+        pattern.RecurrenceType = 0
+    elif kind in ("weekly", "weekdays"):
+        pattern.RecurrenceType = 1
+        pattern.DayOfWeekMask = 62 if kind == "weekdays" else _weekday_mask(weekdays, begin)
+    elif kind == "monthly":
+        pattern.RecurrenceType = 2
+        pattern.DayOfMonth = begin.day
+    elif kind == "monthly_nth":
+        pattern.RecurrenceType = 3
+        pattern.DayOfWeekMask = WEEKDAY_BITS[begin.weekday()]
+        pattern.Instance = 5 if begin.day > 28 else (begin.day - 1) // 7 + 1
+    else:
+        pattern.RecurrenceType = 5
+        pattern.DayOfMonth = begin.day
+        pattern.MonthOfYear = begin.month
+    if kind != "weekdays":
+        # Outlook erwartet jährliche Intervalle in Monaten.
+        pattern.Interval = interval * 12 if kind == "yearly" else interval
+    pattern.PatternStartDate = _com_time(begin.replace(hour=0, minute=0))
+    if not all_day:
+        pattern.StartTime = _com_time(begin)
+    pattern.Duration = int((finish - begin).total_seconds() // 60)
+    if count:
+        pattern.Occurrences = int(count)
+    elif end_date and end_date.strip():
+        pattern.PatternEndDate = _com_time(_parse_date(end_date, "recurrence_end_date"))
+    else:
+        pattern.NoEndDate = True
+    return _recurrence_info(pattern)
+
+
+def _insert_formatted_body(item, fragment: str) -> bool:
+    """Formatierten Text über den Word-Editor des geöffneten Fensters
+    einfügen. Termine haben kein HTMLBody, Word übernimmt das HTML
+    aber beim Einfügen als Datei mit Formatierung."""
+    tmpdir = tempfile.mkdtemp(prefix="outlook-mcp-")
+    try:
+        path = os.path.join(tmpdir, "text.htm")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('<html><head><meta charset="utf-8"></head><body>'
+                     f"{fragment}</body></html>")
+        document = item.GetInspector.WordEditor
+        document.Range(0, 0).InsertFile(path, "", False, False, False)
+        return True
+    except Exception as exc:
+        log.warning("Formatierter Text konnte nicht eingefügt werden: %s", exc)
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _open_meeting_draft_impl(subject, start, end, duration_minutes, location,
-                             required, optional, rooms, body) -> dict:
-    begin, finish = _meeting_period(start, end, duration_minutes)
+                             required, optional, rooms, body, body_is_html=False,
+                             all_day=False, recurrence="", recurrence_interval=1,
+                             recurrence_weekdays=None, recurrence_end_date="",
+                             recurrence_count=0, show_as="", reminder_minutes=None,
+                             private=False, categories="", attachments=None,
+                             font=None, font_size=None) -> dict:
+    begin, finish = _meeting_period(start, end, duration_minutes, all_day)
+    files = _file_paths(attachments, "Datei")
+    busy = None
+    if show_as and show_as.strip():
+        key = show_as.strip().lower()
+        if key not in BUSY_VALUES:
+            raise ValueError("show_as muss 'frei', 'mit Vorbehalt', 'beschäftigt', "
+                             "'abwesend' oder 'anderswo tätig' sein.")
+        busy = BUSY_VALUES[key]
+
     item = _namespace().Application.CreateItem(ITEM_TYPE_APPOINTMENT)
     item.Subject = subject or ""
+    if all_day:
+        item.AllDayEvent = True
     item.Start = _com_time(begin)
     item.End = _com_time(finish)
     if location:
         item.Location = location
-    if body:
+    if body and not body_is_html:
         item.Body = body
+    series = None
+    if recurrence and recurrence.strip():
+        series = _apply_recurrence(item, begin, finish, all_day, recurrence,
+                                   recurrence_interval, recurrence_weekdays,
+                                   recurrence_end_date, recurrence_count)
+    if busy is not None:
+        item.BusyStatus = busy
+    if reminder_minutes is not None:
+        if int(reminder_minutes) < 0:
+            item.ReminderSet = False
+        else:
+            item.ReminderSet = True
+            item.ReminderMinutesBeforeStart = int(reminder_minutes)
+    if private:
+        item.Sensitivity = SENSITIVITY_PRIVATE
+    if categories and categories.strip():
+        item.Categories = categories.strip()
+    for path in files:
+        item.Attachments.Add(path, ATT_BY_VALUE)
     _set_recipients(item, RECIPIENT_REQUIRED, required)
     _set_recipients(item, RECIPIENT_OPTIONAL, optional)
     _set_recipients(item, RECIPIENT_RESOURCE, rooms)
@@ -1710,21 +2343,38 @@ def _open_meeting_draft_impl(subject, start, end, duration_minutes, location,
         item.MeetingStatus = MEETING_ORGANIZER
         unresolved = _unresolved(item)
     item.Display(False)
+    formatted = None
+    if body and body_is_html:
+        formatted = _insert_formatted_body(item, _with_font(body, font, font_size))
+        if not formatted:
+            item.Body = _html_to_text(body)
 
     result = {
         "betreff": _safe(item, "Subject", ""),
         "beginn": _fmt(_dt(_safe(item, "Start"))),
         "ende": _fmt(_dt(_safe(item, "End"))),
+        "ganztaegig": bool(_safe(item, "AllDayEvent", False)),
         "ort": _safe(item, "Location", ""),
         "erforderlich": _safe(item, "RequiredAttendees", ""),
         "optional": _safe(item, "OptionalAttendees", ""),
         "raeume": _safe(item, "Resources", ""),
+        "anzeigen_als": BUSY_STATUS.get(_safe(item, "BusyStatus"), ""),
+        "erinnerung_minuten_vorher": (_safe(item, "ReminderMinutesBeforeStart")
+                                      if _safe(item, "ReminderSet", False) else None),
+        "privat": _safe(item, "Sensitivity", 0) == SENSITIVITY_PRIVATE,
+        "kategorien": _safe(item, "Categories", ""),
+        "anhaenge": [os.path.basename(f) for f in files],
         "hinweis": ("In Outlook geöffnet, nicht gespeichert und nicht "
                     "gesendet. Prüfen, bei Bedarf über die Schaltfläche eine "
                     "Teams-Besprechung hinzufügen, dann selbst senden oder "
                     "speichern. Wird das Fenster ohne Speichern geschlossen, "
                     "bleibt nichts zurück."),
     }
+    if series:
+        result["serie"] = series.get("beschreibung")
+    if formatted is False:
+        result["hinweis_text"] = ("Formatierter Text konnte nicht eingefügt werden, "
+                                  "der Text wurde ohne Formatierung übernommen.")
     if unresolved:
         result["nicht_aufgeloest"] = unresolved
     return result
@@ -1738,12 +2388,13 @@ def _open_meeting_draft_impl(subject, start, end, duration_minutes, location,
 # ============================================================
 
 TEXT_EXTENSIONS = {".txt", ".csv", ".tsv", ".log", ".json", ".xml", ".md",
-                   ".ics", ".vcf", ".ini", ".cfg", ".yaml", ".yml", ".sql",
-                   ".ps1", ".py", ".js", ".css", ".rtf"}
+                   ".vcf", ".ini", ".cfg", ".yaml", ".yml", ".sql",
+                   ".ps1", ".py", ".js", ".css"}
 HTML_EXTENSIONS = {".html", ".htm"}
 IMAGE_FORMATS = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg",
                  ".gif": "gif", ".webp": "webp"}
-SUPPORTED_HINT = ("Unterstützt: PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, MSG, EML, ZIP "
+SUPPORTED_HINT = ("Unterstützt: PDF (auch gescannt), DOCX, XLSX, PPTX, DOC, XLS, PPT, "
+                  "ODT, ODS, ODP, RTF, ICS, MSG, EML, ZIP "
                   "(Inhaltsverzeichnis), HTML, Textdateien, Bilder (PNG, JPG, GIF, WEBP).")
 
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -2044,6 +2695,278 @@ def _ppt_text(path: str) -> tuple[str, str | None]:
                                 "die Zuordnung zu Foliennummern ist ungefähr.")
 
 
+# ---- RTF ----
+# Steuerwörter, deren Gruppe keinen lesbaren Text enthält.
+RTF_SKIP_DESTINATIONS = {
+    "fonttbl", "colortbl", "stylesheet", "info", "pict", "object", "themedata",
+    "colorschememapping", "latentstyles", "datastore", "xmlnstbl", "listtable",
+    "listoverridetable", "revtbl", "rsidtbl", "generator", "header", "footer",
+    "headerl", "headerr", "headerf", "footerl", "footerr", "footerf",
+    "filetbl", "mmathPr", "fldinst", "bkmkstart", "bkmkend", "pgdsctbl",
+}
+RTF_TOKEN = re.compile(
+    r"\\([a-zA-Z]+)(-?\d+)? ?|\\'([0-9a-fA-F]{2})|\\([^a-zA-Z])|([{}])|[\r\n]+|([^\\{}\r\n]+)")
+
+
+def _rtf_text(data: bytes) -> str:
+    """Text aus RTF: Gruppen, Steuerwörter, Codepage und Unicode-Zeichen."""
+    source = data.decode("latin-1")
+    match = re.search(r"\\ansicpg(\d+)", source)
+    codepage = f"cp{match.group(1)}" if match else "cp1252"
+    try:
+        b"".decode(codepage)
+    except LookupError:
+        codepage = "cp1252"
+    out: list[str] = []
+    pending = bytearray()  # \'hh-Bytes sammeln, mehrbytige Codepages
+    stack: list[tuple[bool, int]] = []
+    skip, uc, skip_chars = False, 1, 0
+    star = False
+
+    def flush():
+        if pending:
+            out.append(pending.decode(codepage, errors="replace"))
+            pending.clear()
+
+    for m in RTF_TOKEN.finditer(source):
+        word, arg, hexcode, symbol, brace, text = m.groups()
+        if hexcode is not None:
+            if skip_chars:
+                skip_chars -= 1
+            elif not skip:
+                pending.append(int(hexcode, 16))
+            continue
+        flush()
+        if brace == "{":
+            stack.append((skip, uc))
+            star = False
+        elif brace == "}":
+            if stack:
+                skip, uc = stack.pop()
+        elif symbol is not None:
+            if symbol == "*":
+                star = True
+            elif not skip and symbol in "\\{}":
+                out.append(symbol)
+            elif not skip and symbol == "~":
+                out.append(" ")
+            elif not skip and symbol == "_":
+                out.append("-")
+        elif word is not None:
+            if star or word in RTF_SKIP_DESTINATIONS:
+                skip, star = True, False
+                continue
+            if skip:
+                continue
+            if word in ("par", "line", "row", "sect", "page"):
+                out.append("\n")
+            elif word in ("tab", "cell"):
+                out.append("\t")
+            elif word == "uc":
+                uc = int(arg or 1)
+            elif word == "u" and arg is not None:
+                value = int(arg)
+                out.append(chr(value + 65536 if value < 0 else value))
+                skip_chars = uc
+            elif word in ("emdash", "endash"):
+                out.append("–")
+            elif word in ("lquote", "rquote"):
+                out.append("'")
+            elif word in ("ldblquote", "rdblquote"):
+                out.append('"')
+            elif word == "bullet":
+                out.append("•")
+        elif text is not None and not skip:
+            if skip_chars:
+                cut = min(skip_chars, len(text))
+                text, skip_chars = text[cut:], skip_chars - cut
+            out.append(text)
+    flush()
+    text = "".join(out).replace("\xa0", " ")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+# ---- OpenDocument (ODT, ODS, ODP) ----
+ODF_TEXT = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+ODF_TABLE = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
+ODF_DRAW = "{urn:oasis:names:tc:opendocument:xmlns:drawing:1.0}"
+ODF_OFFICE = "{urn:oasis:names:tc:opendocument:xmlns:office:1.0}"
+MAX_ODF_REPEAT = 50  # wiederholte Zellen (z. B. 1024 leere Spalten) begrenzen
+
+
+def _odf_inline(elem) -> str:
+    parts = [elem.text or ""]
+    for child in elem:
+        if child.tag == ODF_TEXT + "s":
+            parts.append(" " * int(child.get(ODF_TEXT + "c", "1")))
+        elif child.tag == ODF_TEXT + "tab":
+            parts.append("\t")
+        elif child.tag == ODF_TEXT + "line-break":
+            parts.append("\n")
+        elif child.tag in (ODF_TEXT + "note", ODF_OFFICE + "annotation"):
+            pass  # Fussnoten und Kommentare nicht in den Fliesstext
+        else:
+            parts.append(_odf_inline(child))
+        parts.append(child.tail or "")
+    return "".join(parts)
+
+
+def _odf_cell(cell) -> str:
+    return " ".join(_odf_inline(p).strip() for p in cell.iter()
+                    if p.tag in (ODF_TEXT + "p", ODF_TEXT + "h")).strip()
+
+
+def _odf_text(path: str, limit: int) -> tuple[str, str | None]:
+    with zipfile.ZipFile(path) as archive:
+        if "content.xml" not in archive.namelist():
+            raise ValueError("Keine gültige OpenDocument-Datei (content.xml fehlt).")
+        root = ET.fromstring(_zip_member(archive, "content.xml"))
+    lines: list[str] = []
+    counts = {"Folie": 0, "Blatt": 0}
+    total = [0]
+
+    def emit(line: str):
+        lines.append(line)
+        total[0] += len(line) + 1
+
+    def walk(elem, in_spreadsheet: bool):
+        for child in elem:
+            if total[0] > limit:
+                return
+            tag = child.tag
+            if tag == ODF_DRAW + "page":
+                counts["Folie"] += 1
+                emit(f"\n--- Folie {counts['Folie']} ---")
+                walk(child, False)
+            elif tag == ODF_TABLE + "table" and in_spreadsheet:
+                counts["Blatt"] += 1
+                emit(f"\n--- Blatt: {child.get(ODF_TABLE + 'name', counts['Blatt'])} ---")
+                walk(child, False)
+            elif tag == ODF_TABLE + "table-row":
+                cells = []
+                for cell in child:
+                    if cell.tag not in (ODF_TABLE + "table-cell",
+                                        ODF_TABLE + "covered-table-cell"):
+                        continue
+                    repeat = int(cell.get(ODF_TABLE + "number-columns-repeated", "1"))
+                    cells.extend([_odf_cell(cell)] * min(repeat, MAX_ODF_REPEAT))
+                while cells and not cells[-1]:
+                    cells.pop()
+                if cells:
+                    emit("\t".join(cells))
+            elif tag in (ODF_TEXT + "p", ODF_TEXT + "h"):
+                line = _odf_inline(child).strip()
+                if line:
+                    emit(line)
+            elif tag == ODF_OFFICE + "spreadsheet":
+                walk(child, True)
+            else:
+                walk(child, in_spreadsheet)
+
+    walk(root, False)
+    note = None
+    if counts["Folie"]:
+        note = f"{counts['Folie']} Folien"
+    elif counts["Blatt"]:
+        note = f"{counts['Blatt']} Blätter, Zellen tabulatorgetrennt"
+    return "\n".join(lines).strip(), note
+
+
+# ---- Kalenderdateien (ICS) ----
+
+def _ics_value(raw: str) -> str:
+    return (raw.replace("\\n", "\n").replace("\\N", "\n").replace("\\,", ",")
+            .replace("\\;", ";").replace("\\\\", "\\").strip())
+
+
+def _ics_date(value: str, params: dict) -> str:
+    value = value.strip()
+    try:
+        if len(value) == 8:
+            return datetime.strptime(value, "%Y%m%d").strftime("%Y-%m-%d")
+        dt = datetime.strptime(value.rstrip("Z")[:15], "%Y%m%dT%H%M%S")
+    except ValueError:
+        return value
+    if value.endswith("Z"):
+        local = dt.replace(tzinfo=timezone.utc).astimezone()
+        return local.strftime("%Y-%m-%d %H:%M") + " (Ortszeit)"
+    zone = params.get("TZID")
+    return dt.strftime("%Y-%m-%d %H:%M") + (f" ({zone})" if zone else "")
+
+
+def _ics_person(value: str, params: dict) -> str:
+    address = re.sub(r"(?i)^mailto:", "", value.strip())
+    name = params.get("CN", "").strip('"')
+    text = f"{name} <{address}>" if name else address
+    status = params.get("PARTSTAT")
+    role = params.get("ROLE")
+    extras = [x for x in (role, status) if x]
+    return text + (f" [{', '.join(extras)}]" if extras else "")
+
+
+ICS_FIELDS = (("SUMMARY", "Betreff"), ("DTSTART", "Beginn"), ("DTEND", "Ende"),
+              ("LOCATION", "Ort"), ("ORGANIZER", "Organisator"),
+              ("STATUS", "Status"), ("RRULE", "Wiederholung"), ("URL", "Link"))
+
+
+def _ics_text(data: bytes) -> str:
+    """Termine aus einer ICS-Datei lesbar aufbereiten."""
+    text = _decode(data)
+    text = re.sub(r"\r?\n[ \t]", "", text)  # gefaltete Zeilen zusammenfügen
+    method = ""
+    events: list[dict] = []
+    current: dict | None = None
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        head, value = line.split(":", 1)
+        name, *raw_params = head.split(";")
+        name = name.upper()
+        params = {}
+        for p in raw_params:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                params[k.upper()] = v
+        if name == "METHOD":
+            method = value.strip()
+        elif name == "BEGIN" and value.strip().upper() in ("VEVENT", "VTODO"):
+            current = {"_typ": value.strip().upper(), "ATTENDEE": []}
+        elif name == "END" and value.strip().upper() in ("VEVENT", "VTODO"):
+            if current is not None:
+                events.append(current)
+            current = None
+        elif current is not None:
+            if name in ("DTSTART", "DTEND", "DUE"):
+                current[name] = _ics_date(value, params)
+            elif name in ("ORGANIZER",):
+                current[name] = _ics_person(value, params)
+            elif name == "ATTENDEE":
+                current["ATTENDEE"].append(_ics_person(value, params))
+            elif name in ("SUMMARY", "LOCATION", "DESCRIPTION", "STATUS", "RRULE", "URL"):
+                current[name] = _ics_value(value)
+    if not events:
+        return text
+    kind = {"REQUEST": "Einladung", "CANCEL": "Absage", "REPLY": "Antwort",
+            "PUBLISH": "Veröffentlichung"}.get(method.upper(), method)
+    blocks = []
+    for nr, event in enumerate(events, 1):
+        lines = [f"--- {'Aufgabe' if event['_typ'] == 'VTODO' else 'Termin'} {nr} ---"]
+        if kind:
+            lines.append(f"Art: {kind}")
+        for key, label in ICS_FIELDS:
+            if event.get(key):
+                lines.append(f"{label}: {event[key]}")
+        if event.get("DUE"):
+            lines.append(f"Fällig: {event['DUE']}")
+        if event["ATTENDEE"]:
+            lines.append("Teilnehmende:\n  " + "\n  ".join(event["ATTENDEE"]))
+        if event.get("DESCRIPTION"):
+            lines.append("Beschreibung:\n" + event["DESCRIPTION"])
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
 def _zip_member(archive: zipfile.ZipFile, name: str) -> bytes:
     if archive.getinfo(name).file_size > MAX_ZIP_MEMBER_BYTES:
         raise ValueError("Dokument zu gross zum Lesen.")
@@ -2088,11 +3011,16 @@ def _pptx_text(path: str) -> tuple[str, str | None]:
     return "\n\n".join(parts), f"{len(slides)} Folien"
 
 
+def _zip_files(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    return [info for info in archive.infolist() if not info.is_dir()]
+
+
 def _zip_listing(path: str) -> str:
     with zipfile.ZipFile(path) as archive:
-        lines = [f"{info.filename} ({info.file_size} Bytes)"
-                 for info in archive.infolist() if not info.is_dir()]
-    return "Inhalt des ZIP-Archivs:\n" + "\n".join(lines)
+        lines = [f"{nr}. {info.filename} ({info.file_size} Bytes)"
+                 for nr, info in enumerate(_zip_files(archive), 1)]
+    return ("Inhalt des ZIP-Archivs (einzelne Dateien mit get_attachment und "
+            "member=Nummer oder Name lesen):\n" + "\n".join(lines))
 
 
 def _eml_text(path: str) -> str:
@@ -2104,9 +3032,10 @@ def _eml_text(path: str) -> str:
         f"Cc: {message['cc'] or ''}",
         f"Datum: {message['date'] or ''}",
     ]
-    names = [p.get_filename() for p in message.iter_attachments() if p.get_filename()]
+    names = [_eml_part_name(p) for p in message.iter_attachments()]
     if names:
-        lines.append("Anhänge: " + ", ".join(names))
+        lines.append("Anhänge (mit member=Nummer oder Name lesen): " + ", ".join(
+            f"{nr}. {name}" for nr, name in enumerate(names, 1)))
     body = message.get_body(preferencelist=("plain", "html"))
     text = ""
     if body is not None:
@@ -2128,8 +3057,8 @@ def _msg_text(path: str) -> str:
         ]
         names = [a["name"] for a in _attachment_list(item)]
         if names:
-            lines.append("Anhänge: " + ", ".join(names) +
-                         " (nicht direkt lesbar, da in der angehängten Mail)")
+            lines.append("Anhänge (mit member=Nummer oder Name lesen): " + ", ".join(
+                f"{nr}. {name}" for nr, name in enumerate(names, 1)))
         return "\n".join(lines) + "\n\n" + (_safe(item, "Body", "") or "")
     finally:
         try:
@@ -2173,7 +3102,156 @@ def _image_content(path: str, ext: str, info: dict) -> Image | None:
     return None
 
 
-def _extract_attachment(path: str, ext: str, offset: int, limit: int, info: dict):
+def _eml_part_name(part) -> str:
+    name = part.get_filename()
+    if not name and part.get_content_type() == "message/rfc822":
+        inner = part.get_payload(0) if part.is_multipart() else None
+        subject = inner["subject"] if inner is not None else ""
+        name = f"{subject or 'Nachricht'}.eml"
+    return name or f"anhang.{part.get_content_subtype()}"
+
+
+def _pick(candidates: list[str], member: str, kind: str) -> int:
+    """Index (0-basiert) über Nummer oder Name wählen."""
+    wanted = member.strip()
+    if wanted.isdigit():
+        nr = int(wanted)
+        if not 1 <= nr <= len(candidates):
+            raise ValueError(f"Ungültige Nummer {nr} im {kind} (vorhanden: 1 bis {len(candidates)}).")
+        return nr - 1
+    lowered = [c.lower() for c in candidates]
+    if wanted.lower() in lowered:
+        return lowered.index(wanted.lower())
+    # Nur Dateiname ohne Ordnerpfad im Archiv
+    base = [c.replace("\\", "/").rsplit("/", 1)[-1] for c in lowered]
+    if base.count(wanted.lower()) == 1:
+        return base.index(wanted.lower())
+    raise ValueError(f"'{member}' nicht gefunden im {kind}. Vorhanden: "
+                     + ", ".join(f"{i}. {c}" for i, c in enumerate(candidates, 1)))
+
+
+def _safe_ext(name: str) -> str:
+    ext = os.path.splitext(name or "")[1].lower()
+    return ext if re.fullmatch(r"\.[a-z0-9]{1,10}", ext) else ""
+
+
+def _open_member(path: str, ext: str, member: str, tmpdir: str,
+                 depth: int) -> tuple[str, str, str]:
+    """Eine Datei aus ZIP, MSG oder EML in tmpdir speichern.
+    Liefert (Pfad, Endung, Name)."""
+    target = os.path.join(tmpdir, f"inhalt{depth}")
+    if ext == ".zip":
+        with zipfile.ZipFile(path) as archive:
+            files = _zip_files(archive)
+            info = files[_pick([f.filename for f in files], member, "ZIP-Archiv")]
+            if info.flag_bits & 0x1:
+                raise ValueError(f"'{info.filename}' ist verschlüsselt und kann nicht gelesen werden.")
+            data = _zip_member(archive, info.filename)
+        name = info.filename
+        new_ext = _safe_ext(name)
+        with open(target + new_ext, "wb") as fh:
+            fh.write(data)
+        return target + new_ext, new_ext, name
+    if ext == ".msg":
+        item = _namespace().OpenSharedItem(path)
+        try:
+            attachments = item.Attachments
+            names = [_attachment_name(attachments.Item(n))
+                     for n in range(1, int(attachments.Count) + 1)]
+            if not names:
+                raise ValueError("Die angehängte Mail hat keine Anhänge.")
+            att = attachments.Item(_pick(names, member, "Anhang der Mail") + 1)
+            att_type = _safe(att, "Type")
+            if att_type == ATT_BY_REFERENCE:
+                raise ValueError("Verknüpfung auf eine externe Datei, Inhalt ist nicht gespeichert.")
+            if (_safe(att, "Size", 0) or 0) > MAX_ATTACHMENT_BYTES:
+                raise ValueError("Anhang zu gross.")
+            name = _attachment_name(att)
+            new_ext = ".msg" if att_type == ATT_EMBEDDED else _safe_ext(name)
+            att.SaveAsFile(target + new_ext)
+        finally:
+            try:
+                item.Close(CLOSE_DISCARD)
+            except Exception:
+                pass
+            del item
+        return target + new_ext, new_ext, name
+    if ext == ".eml":
+        message = email.message_from_bytes(_read_bytes(path), policy=policy.default)
+        parts = list(message.iter_attachments())
+        if not parts:
+            raise ValueError("Die angehängte Mail hat keine Anhänge.")
+        names = [_eml_part_name(p) for p in parts]
+        index = _pick(names, member, "Anhang der Mail")
+        part = parts[index]
+        if part.get_content_type() == "message/rfc822":
+            data = part.get_payload(0).as_bytes()
+            new_ext = ".eml"
+        else:
+            data = part.get_payload(decode=True) or b""
+            new_ext = _safe_ext(names[index])
+        if len(data) > MAX_ATTACHMENT_BYTES:
+            raise ValueError("Anhang zu gross.")
+        with open(target + new_ext, "wb") as fh:
+            fh.write(data)
+        return target + new_ext, new_ext, names[index]
+    raise ValueError("member ist nur bei ZIP-Archiven und angehängten Mails "
+                     "(MSG, EML) möglich.")
+
+
+def _pdf_page_images(path: str, page: int, info: dict) -> list:
+    """Seiten eines PDFs ohne Text (Scan) als Bilder liefern, damit Claude
+    sie selbst lesen kann. Pro Seite wird das grösste eingebettete Bild
+    verwendet."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(path)
+    count = len(reader.pages)
+    first = max(1, int(page or 1))
+    if first > count:
+        raise ValueError(f"page {first} liegt hinter der letzten Seite ({count}).")
+    last = min(count, first + MAX_PDF_IMAGE_PAGES - 1)
+    tmpdir = os.path.dirname(path)
+    images, missing = [], []
+    for nr in range(first, last + 1):
+        try:
+            candidates = list(reader.pages[nr - 1].images)
+        except Exception as exc:
+            log.warning("Bilder auf Seite %s nicht lesbar: %s", nr, exc)
+            candidates = []
+        best = None
+        for candidate in candidates:
+            try:
+                img = candidate.image
+            except Exception:
+                continue
+            if img is not None and (best is None or
+                                    img.width * img.height > best.width * best.height):
+                best = img
+        if best is None:
+            missing.append(nr)
+            continue
+        file = os.path.join(tmpdir, f"seite{nr}.png")
+        best.convert("L" if best.mode in ("1", "L", "LA") else "RGB").save(file)
+        page_info: dict = {}
+        image = _image_content(file, ".png", page_info)
+        if image is None:
+            missing.append(nr)
+            continue
+        images.append(image)
+    info["inhalt"] = (f"Gescanntes PDF ohne Text: Seiten {first} bis {last} von "
+                      f"{count} als Bilder, siehe nachfolgende Bilddaten.")
+    if missing:
+        info["ohne_bild"] = missing
+    if last < count:
+        info["naechste_seite"] = last + 1
+        info["fortsetzung"] = (f"Weitere Seiten mit get_attachment und "
+                               f"page={last + 1} abrufen.")
+    return images
+
+
+def _extract_attachment(path: str, ext: str, offset: int, limit: int, info: dict,
+                        page: int = 1):
     if ext in IMAGE_FORMATS:
         try:
             image = _image_content(path, ext, info)
@@ -2191,6 +3269,12 @@ def _extract_attachment(path: str, ext: str, offset: int, limit: int, info: dict
     note = None
     if ext == ".pdf":
         text, note = _pdf_text(path, need)
+        if not text:
+            images = _pdf_page_images(path, page, info)
+            if images:
+                return [info, *images]
+            info["hinweis"] = note + " Es wurden auch keine Seitenbilder gefunden."
+            return info
     elif ext in (".xlsx", ".xlsm"):
         text, note = _xlsx_text(path, need)
     elif ext in (".docx", ".docm"):
@@ -2209,6 +3293,12 @@ def _extract_attachment(path: str, ext: str, offset: int, limit: int, info: dict
         text = _eml_text(path)
     elif ext == ".zip":
         text = _zip_listing(path)
+    elif ext == ".rtf":
+        text = _rtf_text(_read_bytes(path))
+    elif ext in (".odt", ".ods", ".odp", ".ott", ".ots", ".otp"):
+        text, note = _odf_text(path, need)
+    elif ext in (".ics", ".vcs"):
+        text = _ics_text(_read_bytes(path))
     elif ext in HTML_EXTENSIONS:
         text = _html_to_text(_decode(_read_bytes(path)))
     elif ext in TEXT_EXTENSIONS:
@@ -2234,7 +3324,8 @@ def _extract_attachment(path: str, ext: str, offset: int, limit: int, info: dict
     return info
 
 
-def _get_attachment_impl(entry_id, store_id, index, name, offset, max_chars):
+def _get_attachment_impl(entry_id, store_id, index, name, offset, max_chars,
+                         member="", page=1):
     item = _open_item(entry_id, store_id)
     attachments = item.Attachments
     count = int(attachments.Count)
@@ -2282,7 +3373,13 @@ def _get_attachment_impl(entry_id, store_id, index, name, offset, max_chars):
     try:
         path = os.path.join(tmpdir, "anhang" + ext)
         att.SaveAsFile(path)
-        return _extract_attachment(path, ext, offset, limit, info)
+        chain = [m.strip() for m in (member or "").split(">") if m.strip()]
+        if len(chain) > MAX_MEMBER_DEPTH:
+            raise ValueError(f"member: höchstens {MAX_MEMBER_DEPTH} Ebenen.")
+        for depth, part in enumerate(chain, 1):
+            path, ext, inner_name = _open_member(path, ext, part, tmpdir, depth)
+            info["inhalt_von"] = " > ".join(filter(None, (info.get("inhalt_von"), inner_name)))
+        return _extract_attachment(path, ext, offset, limit, info, page)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -2303,7 +3400,9 @@ mcp = FastMCP(
         "Zeiten find_meeting_times verwenden. Unbeantwortete Einladungen "
         "liefert list_open_invitations, Besprechungsräume list_rooms. "
         "Entwürfe mit create_draft, "
-        "create_reply_draft und create_forward_draft anlegen. "
+        "create_reply_draft und create_forward_draft anlegen (mit Anhängen, "
+        "Bildern, Signatur und Eigenschaften wie Wichtigkeit), bestehende "
+        "Entwürfe mit list_drafts finden und mit update_draft ändern. "
         "Besprechungseinladungen öffnet "
         "open_meeting_draft vorbefüllt in einem Outlook-Fenster, ohne zu "
         "speichern. Senden und Löschen ist nicht möglich: Entwürfe und "
@@ -2412,13 +3511,17 @@ async def get_conversation(entry_id: str, store_id: str = "",
 @mcp.tool()
 async def get_attachment(entry_id: str, store_id: str = "", index: int = 0,
                          name: str = "", offset: int = 0,
-                         max_chars: int = MAX_ATTACHMENT_CHARS):
+                         max_chars: int = MAX_ATTACHMENT_CHARS,
+                         member: str = "", page: int = 1):
     """Liest den Inhalt eines Anhangs einer E-Mail oder eines Termins.
-    Text wird aus PDF, DOCX, XLSX, PPTX, den alten Office-Formaten DOC,
-    XLS und PPT, angehängten Mails (MSG, EML),
-    HTML- und Textdateien extrahiert, bei ZIP wird das Inhaltsverzeichnis
-    geliefert. Bilder (PNG, JPG, GIF, WEBP) werden als Bild übergeben,
-    grosse Bilder vorher verkleinert. Die Mail wird dabei nicht verändert.
+    Text wird aus PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, OpenDocument
+    (ODT, ODS, ODP), RTF, angehängten Mails (MSG, EML), HTML- und
+    Textdateien extrahiert. Kalenderdateien (ICS) werden als Termine
+    aufbereitet. Bei ZIP wird das Inhaltsverzeichnis geliefert, einzelne
+    Dateien darin mit member. Gescannte PDFs ohne Text werden seitenweise
+    als Bilder geliefert. Bilder (PNG, JPG, GIF, WEBP) werden als Bild
+    übergeben, grosse Bilder vorher verkleinert. Die Mail wird dabei
+    nicht verändert.
 
     Lange Texte werden in Teilen geliefert: Enthält die Antwort
     'naechster_offset', mit diesem Wert als offset erneut aufrufen.
@@ -2429,9 +3532,15 @@ async def get_attachment(entry_id: str, store_id: str = "", index: int = 0,
         können index und name weggelassen werden.
     offset: Startposition im Text (Zeichen), Standard 0.
     max_chars: Maximale Textlänge pro Aufruf.
+    member: Datei in einem ZIP-Archiv oder Anhang einer angehängten Mail
+        (MSG, EML), als Nummer oder Name aus dem Verzeichnis des Anhangs.
+        Tiefer verschachtelt mit '>' getrennt, z. B. 'daten.zip > bericht.pdf'.
+    page: Bei gescannten PDFs die erste Seite, die als Bild geliefert
+        wird (Standard 1). Enthält die Antwort 'naechste_seite', mit
+        diesem Wert erneut aufrufen.
     """
     return await _run(_get_attachment_impl, entry_id, store_id, index,
-                      name, offset, max_chars)
+                      name, offset, max_chars, member, page)
 
 
 @mcp.tool()
@@ -2581,7 +3690,67 @@ async def list_rooms(
                       duration_minutes, only_free, limit)
 
 
+MAIL_OPTIONS_DOC = """
+    Gemeinsame Optionen (leer bzw. nicht angegeben = unverändert bzw.
+    Outlook-Standard):
+    importance: 'niedrig', 'normal' oder 'hoch'.
+    sensitivity: 'normal', 'persönlich', 'privat' oder 'vertraulich'.
+    read_receipt / delivery_receipt: Lese- bzw. Zustellbestätigung anfordern.
+    categories: Kategorien, durch Komma getrennt ('' entfernt sie).
+    follow_up: Zur Nachverfolgung kennzeichnen (false entfernt die
+        Kennzeichnung). follow_up_due: Fälligkeit (JJJJ-MM-TT).
+    deferred_delivery: Erst ab diesem Zeitpunkt zustellen (JJJJ-MM-TT HH:MM),
+        wirkt erst beim Senden in Outlook ('' entfernt).
+    expires: Ablaufdatum der Mail (JJJJ-MM-TT HH:MM, '' entfernt).
+    font / font_size: Schrift und Grösse (pt) für den Text dieses Entwurfs,
+        Standard aus OUTLOOK_MCP_DRAFT_FONT; font='' = Formatvorlage der Mail.
+    attachments: Pfade lokaler Dateien, die angehängt werden.
+    inline_images: Pfade lokaler Bilder (PNG, JPG, GIF, BMP), die im Text
+        erscheinen. Bei body_is_html mit <img src="cid:Dateiname"> platzieren,
+        sonst stehen sie am Ende des Texts.
+    """
+
+
+def _with_doc(extra: str):
+    def decorate(fn):
+        fn.__doc__ = (fn.__doc__ or "") + extra
+        return fn
+    return decorate
+
+
+def _mail_options(importance, sensitivity, read_receipt, delivery_receipt, categories,
+                  follow_up, follow_up_due, deferred_delivery, expires, font,
+                  font_size, attachments, inline_images) -> dict:
+    return {"importance": importance, "sensitivity": sensitivity,
+            "read_receipt": read_receipt, "delivery_receipt": delivery_receipt,
+            "categories": categories, "follow_up": follow_up,
+            "follow_up_due": follow_up_due, "deferred_delivery": deferred_delivery,
+            "expires": expires, "font": font, "font_size": font_size,
+            "attachments": attachments, "inline_images": inline_images}
+
+
 @mcp.tool()
+async def list_drafts(query: str = "", limit: int = 20) -> dict:
+    """Listet die Entwürfe aller eingebundenen Postfächer, zuletzt
+    geänderte zuerst, mit Empfängern, Anhängen und Eigenschaften. Die
+    entry_id dient für update_draft.
+
+    query: Teil von Betreff oder Empfängern.
+    limit: Maximale Anzahl Entwürfe.
+    """
+    return await _run(_list_drafts_impl, query, limit)
+
+
+@mcp.tool()
+async def list_signatures() -> dict:
+    """Listet die in Outlook eingerichteten Signaturen. Der Name kann bei
+    create_draft, create_reply_draft und create_forward_draft als
+    'signature' angegeben werden."""
+    return await _run(_list_signatures_impl)
+
+
+@mcp.tool()
+@_with_doc(MAIL_OPTIONS_DOC)
 async def create_draft(
     to: list[str] | None = None,
     subject: str = "",
@@ -2590,22 +3759,43 @@ async def create_draft(
     bcc: list[str] | None = None,
     body_is_html: bool = False,
     open_in_outlook: bool = False,
+    signature: str = "",
+    importance: str = "",
+    sensitivity: str = "",
+    read_receipt: bool | None = None,
+    delivery_receipt: bool | None = None,
+    categories: str | None = None,
+    follow_up: bool | None = None,
+    follow_up_due: str = "",
+    deferred_delivery: str | None = None,
+    expires: str | None = None,
+    font: str | None = None,
+    font_size: int | None = None,
+    attachments: list[str] | None = None,
+    inline_images: list[str] | None = None,
 ) -> dict:
-    """Legt eine neue E-Mail als Entwurf im Ordner Entwürfe an, mit der
-    Standardsignatur aus Outlook. Die Mail wird nicht gesendet.
+    """Legt eine neue E-Mail als Entwurf im Ordner Entwürfe an. Die Mail
+    wird nicht gesendet.
 
     to / cc / bcc: E-Mail-Adressen der Empfängerinnen und Empfänger.
     subject: Betreff.
     body: Text der Mail, Zeilenumbrüche werden übernommen. Steht über
         der Signatur.
-    body_is_html: body ist ein HTML-Fragment (z. B. mit <p>, <b>, <ul>).
+    body_is_html: body ist ein HTML-Fragment (z. B. mit <p>, <b>, <ul>,
+        <table>, Links).
     open_in_outlook: Entwurf zusätzlich in einem Outlook-Fenster öffnen.
+    signature: Leer = Standardsignatur von Outlook, 'keine' = ohne
+        Signatur, sonst der Name einer Signatur aus list_signatures.
     """
+    options = _mail_options(importance, sensitivity, read_receipt, delivery_receipt,
+                            categories, follow_up, follow_up_due, deferred_delivery,
+                            expires, font, font_size, attachments, inline_images)
     return await _run(_create_draft_impl, to, cc, bcc, subject, body,
-                      body_is_html, open_in_outlook)
+                      body_is_html, open_in_outlook, signature, options)
 
 
 @mcp.tool()
+@_with_doc(MAIL_OPTIONS_DOC)
 async def create_reply_draft(
     entry_id: str,
     body: str = "",
@@ -2615,6 +3805,22 @@ async def create_reply_draft(
     bcc: list[str] | None = None,
     body_is_html: bool = False,
     open_in_outlook: bool = False,
+    subject: str = "",
+    include_attachments: bool = False,
+    signature: str = "",
+    importance: str = "",
+    sensitivity: str = "",
+    read_receipt: bool | None = None,
+    delivery_receipt: bool | None = None,
+    categories: str | None = None,
+    follow_up: bool | None = None,
+    follow_up_due: str = "",
+    deferred_delivery: str | None = None,
+    expires: str | None = None,
+    font: str | None = None,
+    font_size: int | None = None,
+    attachments: list[str] | None = None,
+    inline_images: list[str] | None = None,
 ) -> dict:
     """Legt eine Antwort auf eine E-Mail als Entwurf an, wie "Antworten"
     bzw. "Allen antworten" in Outlook: Empfänger und Betreff werden
@@ -2627,12 +3833,22 @@ async def create_reply_draft(
     cc / bcc: Zusätzliche E-Mail-Adressen.
     body_is_html: body ist ein HTML-Fragment.
     open_in_outlook: Entwurf zusätzlich in einem Outlook-Fenster öffnen.
+    subject: Eigener Betreff statt "AW: …".
+    include_attachments: Anhänge der Originalmail übernehmen (ohne Bilder,
+        die nur im Text stehen, z. B. Logos).
+    signature: Leer = Standardsignatur von Outlook für Antworten,
+        'keine' = ohne Signatur, sonst der Name aus list_signatures.
     """
+    options = _mail_options(importance, sensitivity, read_receipt, delivery_receipt,
+                            categories, follow_up, follow_up_due, deferred_delivery,
+                            expires, font, font_size, attachments, inline_images)
     return await _run(_create_reply_draft_impl, entry_id, store_id, body,
-                      body_is_html, reply_all, cc, bcc, open_in_outlook)
+                      body_is_html, reply_all, cc, bcc, open_in_outlook, subject,
+                      include_attachments, signature, options)
 
 
 @mcp.tool()
+@_with_doc(MAIL_OPTIONS_DOC)
 async def create_forward_draft(
     entry_id: str,
     to: list[str] | None = None,
@@ -2642,19 +3858,102 @@ async def create_forward_draft(
     bcc: list[str] | None = None,
     body_is_html: bool = False,
     open_in_outlook: bool = False,
+    subject: str = "",
+    signature: str = "",
+    importance: str = "",
+    sensitivity: str = "",
+    read_receipt: bool | None = None,
+    delivery_receipt: bool | None = None,
+    categories: str | None = None,
+    follow_up: bool | None = None,
+    follow_up_due: str = "",
+    deferred_delivery: str | None = None,
+    expires: str | None = None,
+    font: str | None = None,
+    font_size: int | None = None,
+    attachments: list[str] | None = None,
+    inline_images: list[str] | None = None,
 ) -> dict:
     """Legt eine Weiterleitung einer E-Mail als Entwurf an, mit allen
     Anhängen der Originalmail. Der Text steht über Signatur und
     weitergeleiteter Mail. Die Weiterleitung wird nicht gesendet.
+    Einzelne Originalanhänge lassen sich danach mit update_draft
+    (remove_attachments) entfernen.
 
     entry_id / store_id: Werte aus search_mails.
     to / cc / bcc: E-Mail-Adressen der Empfängerinnen und Empfänger.
     body: Begleittext, Zeilenumbrüche werden übernommen.
     body_is_html: body ist ein HTML-Fragment.
     open_in_outlook: Entwurf zusätzlich in einem Outlook-Fenster öffnen.
+    subject: Eigener Betreff statt "WG: …".
+    signature: Leer = Standardsignatur von Outlook für Weiterleitungen,
+        'keine' = ohne Signatur, sonst der Name aus list_signatures.
     """
+    options = _mail_options(importance, sensitivity, read_receipt, delivery_receipt,
+                            categories, follow_up, follow_up_due, deferred_delivery,
+                            expires, font, font_size, attachments, inline_images)
     return await _run(_create_forward_draft_impl, entry_id, store_id, to, cc,
-                      bcc, body, body_is_html, open_in_outlook)
+                      bcc, body, body_is_html, open_in_outlook, subject,
+                      signature, options)
+
+
+@mcp.tool()
+@_with_doc(MAIL_OPTIONS_DOC)
+async def update_draft(
+    entry_id: str,
+    store_id: str = "",
+    subject: str | None = None,
+    body: str | None = None,
+    body_mode: str = "replace",
+    body_is_html: bool = False,
+    to: list[str] | None = None,
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
+    add_to: list[str] | None = None,
+    add_cc: list[str] | None = None,
+    add_bcc: list[str] | None = None,
+    open_in_outlook: bool = False,
+    remove_attachments: list[str] | None = None,
+    importance: str = "",
+    sensitivity: str = "",
+    read_receipt: bool | None = None,
+    delivery_receipt: bool | None = None,
+    categories: str | None = None,
+    follow_up: bool | None = None,
+    follow_up_due: str = "",
+    deferred_delivery: str | None = None,
+    expires: str | None = None,
+    font: str | None = None,
+    font_size: int | None = None,
+    attachments: list[str] | None = None,
+    inline_images: list[str] | None = None,
+) -> dict:
+    """Ändert einen bestehenden, ungesendeten Entwurf im Ordner Entwürfe:
+    Betreff, Empfängerinnen und Empfänger, den eigenen Text, Anhänge und
+    Eigenschaften. Signatur und zitierte bzw. weitergeleitete Mail bleiben
+    erhalten. Der Entwurf wird gespeichert, nicht gesendet. Nicht
+    angegebene Felder bleiben unverändert. Ist der Entwurf in Outlook in
+    einem Fenster geöffnet, wird er nicht geändert.
+
+    entry_id / store_id: Werte des Entwurfs, z. B. aus list_drafts.
+    subject: Neuer Betreff.
+    body: Neuer Text, Zeilenumbrüche werden übernommen.
+    body_mode: 'replace' ersetzt den eigenen Text oberhalb von Signatur
+        und Zitat (Standard), 'prepend' stellt den Text voran, 'append'
+        fügt ihn am Ende des eigenen Texts an.
+    body_is_html: body ist ein HTML-Fragment.
+    to / cc / bcc: Ersetzen alle bisherigen Adressen dieser Art; eine
+        leere Liste entfernt sie.
+    add_to / add_cc / add_bcc: Ergänzen Adressen, bisherige bleiben.
+    open_in_outlook: Entwurf danach in einem Outlook-Fenster öffnen.
+    remove_attachments: Anhänge entfernen, als Nummer oder Name.
+    """
+    options = _mail_options(importance, sensitivity, read_receipt, delivery_receipt,
+                            categories, follow_up, follow_up_due, deferred_delivery,
+                            expires, font, font_size, attachments, inline_images)
+    return await _run(_update_draft_impl, entry_id, store_id, subject, body,
+                      body_mode, body_is_html, to, cc, bcc, add_to, add_cc,
+                      add_bcc, open_in_outlook, remove_attachments, options)
 
 
 @mcp.tool()
@@ -2668,6 +3967,20 @@ async def open_meeting_draft(
     optional: list[str] | None = None,
     rooms: list[str] | None = None,
     body: str = "",
+    body_is_html: bool = False,
+    all_day: bool = False,
+    recurrence: str = "",
+    recurrence_interval: int = 1,
+    recurrence_weekdays: list[str] | None = None,
+    recurrence_end_date: str = "",
+    recurrence_count: int = 0,
+    show_as: str = "",
+    reminder_minutes: int | None = None,
+    private: bool = False,
+    categories: str = "",
+    attachments: list[str] | None = None,
+    font: str | None = None,
+    font_size: int | None = None,
 ) -> dict:
     """Öffnet eine vorbefüllte Besprechungseinladung in einem Outlook-
     Fenster. Sie wird weder gespeichert noch gesendet und steht erst im
@@ -2677,19 +3990,42 @@ async def open_meeting_draft(
     Eine Teams-Besprechung wird im Fenster über die Schaltfläche
     hinzugefügt. Freie Zeiten vorher mit find_meeting_times suchen.
 
-    start: Beginn (JJJJ-MM-TT HH:MM), Ortszeit.
+    start: Beginn (JJJJ-MM-TT HH:MM), Ortszeit; bei all_day nur das Datum.
     subject: Betreff.
-    end: Ende (JJJJ-MM-TT HH:MM). Leer = start + duration_minutes.
+    end: Ende (JJJJ-MM-TT HH:MM). Leer = start + duration_minutes. Bei
+        all_day der letzte Tag (JJJJ-MM-TT, inklusive), leer = ein Tag.
     duration_minutes: Dauer in Minuten, wenn end leer ist (Standard 30).
     location: Ort.
     required / optional: E-Mail-Adressen der erforderlichen bzw.
         optionalen Teilnehmenden.
     rooms: E-Mail-Adressen von Räumen oder Ressourcen.
-    body: Text der Einladung (reiner Text, Zeilenumbrüche werden übernommen).
+    body: Text der Einladung, Zeilenumbrüche werden übernommen.
+    body_is_html: body ist ein HTML-Fragment (fett, Listen, Tabellen, Links).
+    all_day: Ganztägiger Termin.
+    recurrence: Serie: 'täglich', 'werktags', 'wöchentlich', 'monatlich'
+        (gleicher Tag im Monat), 'monatlich_wochentag' (z. B. jeder zweite
+        Dienstag) oder 'jährlich'. Leer = Einzeltermin.
+    recurrence_interval: Jeden n-ten Tag, n-te Woche, n-ten Monat bzw. n-te Jahr.
+    recurrence_weekdays: Bei 'wöchentlich' die Wochentage (z. B. ['Montag',
+        'Donnerstag']), Standard der Wochentag von start.
+    recurrence_end_date: Letzter möglicher Termin der Serie (JJJJ-MM-TT).
+    recurrence_count: Anzahl Termine. Ohne Ende und Anzahl läuft die Serie
+        ohne Enddatum.
+    show_as: 'frei', 'mit Vorbehalt', 'beschäftigt', 'abwesend' oder
+        'anderswo tätig'.
+    reminder_minutes: Erinnerung Minuten vor Beginn, -1 = keine,
+        leer = Outlook-Standard.
+    private: Als privat markieren.
+    categories: Kategorien, durch Komma getrennt.
+    attachments: Pfade lokaler Dateien, die angehängt werden.
+    font / font_size: Schrift für formatierten Text (body_is_html).
     """
     return await _run(_open_meeting_draft_impl, subject, start, end,
                       duration_minutes, location, required, optional, rooms,
-                      body)
+                      body, body_is_html, all_day, recurrence, recurrence_interval,
+                      recurrence_weekdays, recurrence_end_date, recurrence_count,
+                      show_as, reminder_minutes, private, categories, attachments,
+                      font, font_size)
 
 
 def main() -> None:

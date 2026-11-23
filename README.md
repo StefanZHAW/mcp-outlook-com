@@ -2,7 +2,7 @@
 
 MCP server for **Claude Desktop**: read access to emails, calendars and attachments in **classic Outlook** via the COM object model, plus creating email drafts and preparing meeting invitations.
 
-The only write operations are creating drafts (new mail, reply, forward); existing drafts are never modified. Meeting invitations are opened pre-filled in an Outlook window but not saved. Nothing is sent, moved or deleted; there is deliberately no tool for that. Reading a mail does not mark it as read. Attachments are saved briefly to a temporary directory for reading and deleted afterwards.
+The only write operations are creating drafts (new mail, reply, forward) and changing unsent drafts in the Drafts folder. Meeting invitations are opened pre-filled in an Outlook window but not saved. Nothing is sent, moved or deleted; there is deliberately no tool for that. Reading a mail does not mark it as read. Attachments are saved briefly to a temporary directory for reading and deleted afterwards.
 
 ## Installation
 
@@ -27,7 +27,7 @@ Start the server with `mcp-outlook-com.exe` from the virtual environment or with
 | `search_mails` | Search mails (term, folder, sender, recipient, date range, unread, with attachments, attachment name, flagged, category, importance), optionally via the Outlook search index |
 | `get_mail` | Read a mail in full: BCC, importance, sensitivity, read/delivery receipt requested, flag with due date, last action (replied/forwarded), text with links or HTML, optionally internet headers with SPF/DKIM/DMARC, list of attachments |
 | `get_conversation` | All mails of a conversation (thread) across folders, chronologically |
-| `get_attachment` | Content of an attachment: text from PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, MSG, EML, HTML and text files, table of contents of ZIP files, images directly (downscaled if needed). Long texts in chunks (`offset`). |
+| `get_attachment` | Content of an attachment: text from PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, ODT, ODS, ODP, RTF, MSG, EML, HTML and text files, ICS files as events, table of contents of ZIP files, files inside ZIP archives and attachments of attached mails (`member`), scanned PDFs as page images (`page`), images directly (downscaled if needed). Long texts in chunks (`offset`). |
 | `list_calendars` | Calendar folders of all mailboxes |
 | `list_events` | Events in a date range, recurring events expanded, including shared calendars (with read permission) |
 | `get_event` | Read an event with attendees, responses, description, reminder, sensitivity, online meeting (Teams/Zoom/Webex link, meeting ID, passcode), exact recurrence pattern and modified or cancelled occurrences |
@@ -35,19 +35,25 @@ Start the server with `mcp-outlook-com.exe` from the virtual environment or with
 | `find_meeting_times` | Time slots in which all attendees are free, with minimum duration and time-of-day window |
 | `list_open_invitations` | Meeting invitations in the own calendar that have not been answered yet |
 | `list_rooms` | Meeting rooms from the Exchange room list with address and location, optionally with availability for a time slot |
-| `create_draft` | New mail as a draft, with the default signature |
-| `create_reply_draft` | Reply or reply all as a draft, text above signature and quoted mail |
-| `create_forward_draft` | Forward as a draft, with the attachments of the original mail |
-| `open_meeting_draft` | Open a pre-filled meeting invitation in an Outlook window without saving it |
+| `list_drafts` | Drafts of all mailboxes, most recently changed first |
+| `list_signatures` | Signatures set up in Outlook |
+| `create_draft` | New mail as a draft, with signature, attachments, inline images and properties |
+| `create_reply_draft` | Reply or reply all as a draft, text above signature and quoted mail, optionally with own subject and the original attachments |
+| `create_forward_draft` | Forward as a draft, with the attachments of the original mail, optionally with own subject |
+| `update_draft` | Change an unsent draft: subject, recipients, own text, attachments and properties; signature and quoted mail are kept |
+| `open_meeting_draft` | Open a pre-filled meeting invitation in an Outlook window without saving it: all-day, recurring, show as, reminder, private, categories, attachments, formatted text |
 
 ### Drafts
 
 Drafts are stored in the Drafts folder with `Save` and never sent. Sending is done manually in Outlook. With `open_in_outlook`, the draft is also opened in an Outlook window for review.
 
 - The text (`body`) is inserted as HTML; line breaks are preserved. With `body_is_html`, an HTML fragment can be passed.
-- The font (default Aptos 12 pt) is set directly on each paragraph. Otherwise the mail's style sheet would apply, which for replies comes from the original mail and varies between Outlook versions. Font settings in an HTML fragment take precedence.
-- Outlook inserts the default signature itself, just as when composing a mail (signature for new messages or for replies and forwards).
-- Once created, drafts are no longer modified by the server. Make corrections in Outlook or create a new draft.
+- The font (default Aptos 12 pt, per draft with `font` and `font_size`) is set directly on each paragraph. Otherwise the mail's style sheet would apply, which for replies comes from the original mail and varies between Outlook versions. Font settings in an HTML fragment take precedence.
+- `signature`: empty = Outlook inserts the default signature itself, just as when composing a mail (signature for new messages or for replies and forwards); `keine` = no signature; otherwise the name of a signature from `list_signatures` (read from `%APPDATA%\Microsoft\Signatures`, images in the signature are embedded).
+- Properties: `importance`, `sensitivity`, `read_receipt`, `delivery_receipt`, `categories`, `follow_up` with `follow_up_due` (flag for recipients; Outlook does not allow flagging drafts for oneself), `deferred_delivery` (takes effect when the mail is sent in Outlook) and `expires`.
+- `attachments` attaches local files, `inline_images` embeds local images in the text (hidden attachments with a Content-ID); with `body_is_html` they are placed with `<img src="cid:file name">`, otherwise they follow the text. At most 20 files and `OUTLOOK_MCP_MAX_DRAFT_ATTACHMENT_BYTES` in total per call.
+- `create_reply_draft` with `include_attachments` takes over the attachments of the original mail, without images that only appear in the text (e.g. logos). `subject` replaces "AW: …" or "WG: …".
+- `update_draft` changes only unsent mails in the Drafts folder of their mailbox, and only if the draft is not open in an Outlook window. Besides text and recipients it changes the properties above, adds files and images and removes attachments (`remove_attachments`, by number or name). The own text is the part above the signature (bookmark `_MailAutoSig`) and above the quoted or forwarded mail; `body_mode` replaces it (`replace`, default), puts the new text before it (`prepend`) or after it (`append`). `to`, `cc` and `bcc` replace all addresses of that kind (an empty list removes them), `add_to`, `add_cc` and `add_bcc` add addresses.
 - The original mail is not modified when replying or forwarding.
 
 ### Meeting invitations
@@ -56,7 +62,10 @@ Drafts are stored in the Drafts folder with `Save` and never sent. Sending is do
 
 - Without attendees and rooms, a simple appointment is created.
 - A Teams meeting is added in the window via the button (or automatically if Teams is set up to do so for all meetings).
-- The text is inserted as plain text.
+- `all_day` creates an all-day event (`start` and `end` as dates, end inclusive).
+- `recurrence` creates a series: `täglich`, `werktags`, `wöchentlich` (with `recurrence_weekdays`), `monatlich`, `monatlich_wochentag` (e.g. every second Tuesday) or `jährlich`, every `recurrence_interval` units, ending after `recurrence_count` events, on `recurrence_end_date` or never.
+- `show_as`, `reminder_minutes` (-1 = none), `private`, `categories` and `attachments` set the corresponding fields.
+- The text is inserted as plain text; with `body_is_html` as formatted text via the Word editor of the window.
 - The server cannot modify an invitation once it is open, since it has no `EntryID`. Make corrections in the window or open a new invitation.
 
 ### Mail search and reading
@@ -71,9 +80,12 @@ Drafts are stored in the Drafts folder with `Save` and never sent. Sending is do
 
 `list_rooms` reads the Exchange address list with all rooms ("All Rooms" or "Alle Räume"; other name via `OUTLOOK_MCP_ROOM_LIST`). Reading the list needs one request per room, so it is cached for an hour. With `start`, the availability of up to `OUTLOOK_MCP_MAX_ROOM_AVAILABILITY` rooms is checked via free/busy. Room capacity is only returned if it is maintained in Exchange.
 
-### Old Office formats
+### Attachments
 
-DOC, XLS and PPT attachments are read directly from the file (`olefile`, `xlrd`) without starting Office, so macros and embedded objects are never executed. Password-protected files cannot be read. For PPT, the text boxes are listed in file order; the assignment to slide numbers is approximate.
+- DOC, XLS and PPT are read directly from the file (`olefile`, `xlrd`), ODT, ODS, ODP and RTF with the standard library, all without starting an application, so macros and embedded objects are never executed. Password-protected files cannot be read. For PPT, the text boxes are listed in file order; the assignment to slide numbers is approximate.
+- ICS files are returned as events (subject, start, end, location, organizer, attendees, recurrence, description).
+- `member` reads a file inside a ZIP archive or an attachment of an attached mail (MSG, EML), by number or name from the listing of the attachment. Deeper levels are separated by `>`, e.g. `inner.zip > report.pdf` (at most three levels). Encrypted ZIP entries cannot be read.
+- PDFs without a text layer (scans) are returned as page images, `OUTLOOK_MCP_MAX_PDF_IMAGE_PAGES` pages per call; further pages with `page`. Claude reads the text from the images itself; there is no OCR in the server.
 
 ### Shared calendars and free/busy
 
@@ -102,8 +114,10 @@ Via environment variables in the `env` section of the entry in `claude_desktop_c
 | `OUTLOOK_MCP_MAX_ATTACHMENT_CHARS` | 30000 | Amount of text per `get_attachment` call |
 | `OUTLOOK_MCP_MAX_IMAGE_BYTES` | 3500000 | Larger images are downscaled |
 | `OUTLOOK_MCP_MAX_IMAGE_EDGE` | 1568 | Longest edge of downscaled images (pixels) |
+| `OUTLOOK_MCP_MAX_PDF_IMAGE_PAGES` | 3 | Pages of a scanned PDF returned as images per `get_attachment` call |
 | `OUTLOOK_MCP_DRAFT_FONT` | Aptos | Font for the text of drafts, empty = the mail's style sheet |
 | `OUTLOOK_MCP_DRAFT_FONT_SIZE` | 12 | Font size (pt) for the text of drafts |
+| `OUTLOOK_MCP_MAX_DRAFT_ATTACHMENT_BYTES` | 25000000 | Largest total size of files attached per draft call |
 | `OUTLOOK_MCP_DATE_FORMAT` | empty | Date format for calendar filters, empty = Windows short date format. If there are problems, e.g. `%d.%m.%Y %H:%M` |
 | `OUTLOOK_MCP_ROOM_LIST` | empty | Name of the Exchange address list with all rooms, empty = "All Rooms" or a translation of it |
 | `OUTLOOK_MCP_ROOM_CACHE_SECONDS` | 3600 | How long the room list is cached |
