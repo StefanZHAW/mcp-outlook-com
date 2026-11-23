@@ -1,6 +1,6 @@
 [project]
 name = "mcp-outlook-com"
-version = "1.0.0"
+version = "1.1.0"
 description = "MCP-Server für Claude Desktop: E-Mails und Kalender im klassischen Outlook über COM"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -8,12 +8,15 @@ license = "MIT"
 license-files = ["LICENSE"]
 # mcp wird auf 1.x begrenzt, da Version 2 die API ändern kann.
 # pypdf und openpyxl lesen Text aus PDF- bzw. Excel-Anhängen,
+# olefile und xlrd lesen die alten Office-Formate (DOC, PPT bzw. XLS),
 # pillow verkleinert grosse Bilder.
 dependencies = [
   "mcp>=1.10,<2",
   "pywin32",
   "pypdf",
   "openpyxl",
+  "olefile",
+  "xlrd>=2",
   "pillow",
 ]
 

@@ -24,14 +24,17 @@ Start the server with `mcp-outlook-com.exe` from the virtual environment or with
 | Tool | Purpose |
 |---|---|
 | `list_folders` | Mail folders of all mailboxes with the number of (unread) items |
-| `search_mails` | Search mails (term, folder, sender, date range, unread, with attachments) |
-| `get_mail` | Read a mail in full, with a list of its attachments |
-| `get_attachment` | Content of an attachment: text from PDF, DOCX, XLSX, PPTX, MSG, EML, HTML and text files, table of contents of ZIP files, images directly (downscaled if needed). Long texts in chunks (`offset`). |
+| `search_mails` | Search mails (term, folder, sender, recipient, date range, unread, with attachments, attachment name, flagged, category, importance), optionally via the Outlook search index |
+| `get_mail` | Read a mail in full: BCC, importance, sensitivity, read/delivery receipt requested, flag with due date, last action (replied/forwarded), text with links or HTML, optionally internet headers with SPF/DKIM/DMARC, list of attachments |
+| `get_conversation` | All mails of a conversation (thread) across folders, chronologically |
+| `get_attachment` | Content of an attachment: text from PDF, DOCX, XLSX, PPTX, DOC, XLS, PPT, MSG, EML, HTML and text files, table of contents of ZIP files, images directly (downscaled if needed). Long texts in chunks (`offset`). |
 | `list_calendars` | Calendar folders of all mailboxes |
 | `list_events` | Events in a date range, recurring events expanded, including shared calendars (with read permission) |
-| `get_event` | Read an event with attendees, responses and description |
+| `get_event` | Read an event with attendees, responses, description, reminder, sensitivity, online meeting (Teams/Zoom/Webex link, meeting ID, passcode), exact recurrence pattern and modified or cancelled occurrences |
 | `get_free_busy` | Busy times of people or rooms (busy, tentative, out of office, working elsewhere), without subject and location |
 | `find_meeting_times` | Time slots in which all attendees are free, with minimum duration and time-of-day window |
+| `list_open_invitations` | Meeting invitations in the own calendar that have not been answered yet |
+| `list_rooms` | Meeting rooms from the Exchange room list with address and location, optionally with availability for a time slot |
 | `create_draft` | New mail as a draft, with the default signature |
 | `create_reply_draft` | Reply or reply all as a draft, text above signature and quoted mail |
 | `create_forward_draft` | Forward as a draft, with the attachments of the original mail |
@@ -55,6 +58,22 @@ Drafts are stored in the Drafts folder with `Save` and never sent. Sending is do
 - A Teams meeting is added in the window via the button (or automatically if Teams is set up to do so for all meetings).
 - The text is inserted as plain text.
 - The server cannot modify an invitation once it is open, since it has no `EntryID`. Make corrections in the window or open a new invitation.
+
+### Mail search and reading
+
+- `use_index` uses `ci_phrasematch` on the Outlook search index (Windows Search or Exchange). It is much faster for body searches but only finds whole words or word beginnings. Folders without an index fall back to the normal search.
+- `flagged` returns mails flagged for follow-up that are not yet completed. `category`, `recipient` and `attachment_name` are checked per mail and therefore count towards `OUTLOOK_MCP_MAX_SCAN`.
+- With `body_format="text"` (default), `get_mail` also lists the links of the HTML body. `body_format="html"` returns the HTML source instead.
+- `include_headers` returns the internet headers and the SPF, DKIM and DMARC results from `Authentication-Results`. Drafts, sent and purely internal mails have no internet headers.
+- `get_conversation` uses the Outlook conversation function; if the mailbox does not support it, it searches by conversation topic in the Inbox and Sent Items.
+
+### Rooms
+
+`list_rooms` reads the Exchange address list with all rooms ("All Rooms" or "Alle Räume"; other name via `OUTLOOK_MCP_ROOM_LIST`). Reading the list needs one request per room, so it is cached for an hour. With `start`, the availability of up to `OUTLOOK_MCP_MAX_ROOM_AVAILABILITY` rooms is checked via free/busy. Room capacity is only returned if it is maintained in Exchange.
+
+### Old Office formats
+
+DOC, XLS and PPT attachments are read directly from the file (`olefile`, `xlrd`) without starting Office, so macros and embedded objects are never executed. Password-protected files cannot be read. For PPT, the text boxes are listed in file order; the assignment to slide numbers is approximate.
 
 ### Shared calendars and free/busy
 
@@ -86,6 +105,9 @@ Via environment variables in the `env` section of the entry in `claude_desktop_c
 | `OUTLOOK_MCP_DRAFT_FONT` | Aptos | Font for the text of drafts, empty = the mail's style sheet |
 | `OUTLOOK_MCP_DRAFT_FONT_SIZE` | 12 | Font size (pt) for the text of drafts |
 | `OUTLOOK_MCP_DATE_FORMAT` | empty | Date format for calendar filters, empty = Windows short date format. If there are problems, e.g. `%d.%m.%Y %H:%M` |
+| `OUTLOOK_MCP_ROOM_LIST` | empty | Name of the Exchange address list with all rooms, empty = "All Rooms" or a translation of it |
+| `OUTLOOK_MCP_ROOM_CACHE_SECONDS` | 3600 | How long the room list is cached |
+| `OUTLOOK_MCP_MAX_ROOM_AVAILABILITY` | 40 | Maximum number of rooms whose availability `list_rooms` checks |
 
 Example entry in `claude_desktop_config.json` (adjust the path to your installation):
 
